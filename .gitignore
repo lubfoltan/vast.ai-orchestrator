@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Logs — may contain IP addresses, instance IDs
+orchestrator.log
+*.log
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SSH keys — NEVER commit private keys
+*.pem
+id_rsa
+id_ed25519
+vast_key
+*.key
+
+# Dataset folders (can be very large)
+data/
+datasets/
+output/
+results/
+
+# Jupyter
+.ipynb_checkpoints/
