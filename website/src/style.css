@@ -1,0 +1,19 @@
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b0f19;--bg2:#111827;--bg3:#1e293b;
+  --text:#e2e8f0;--muted:#94a3b8;
+  --accent:#3b82f6;--accent2:#6366f1;--accent3:#22d3ee;
+  --green:#22c55e;--red:#ef4444;
+  font-family:'Inter',system-ui,-apple-system,sans-serif;
+  color:var(--text);background:var(--bg);
+}
+html{scroll-behavior:smooth}
+body{line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.section{max-width:1100px;margin:0 auto;padding:80px 24px}
+.section-title{font-size:2rem;font-weight:700;text-align:center;margin-bottom:12px}
+.section-sub{text-align:center;color:var(--muted);margin-bottom:48px;font-size:1.1rem}
+.badge{display:inline-block;padding:4px 12px;border-radius:999px;font-size:.75rem;font-weight:600;letter-spacing:.5px;text-transform:uppercase}
+.badge-blue{background:rgba(59,130,246,.15);color:var(--accent)}
+.badge-green{background:rgba(34,197,94,.15);color:var(--green)}
