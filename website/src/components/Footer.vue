@@ -2,7 +2,7 @@
   <footer class="footer">
     <div class="footer-inner">
       <p>
-        <strong>Vast.ai Training Orchestrator</strong> &mdash; MIT License
+        <strong>SCOUT</strong> — Smart Cloud Orchestrated Unified Trainer &mdash; MIT License
       </p>
       <div class="footer-links">
         <a href="https://github.com/your-username/vast-ai-orchestrator" target="_blank">GitHub</a>

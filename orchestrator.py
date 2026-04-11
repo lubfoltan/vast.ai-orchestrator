@@ -3,9 +3,11 @@
 import logging
 import os
 import threading
+import time
 from typing import Callable, Optional
 
 from config import ExperimentConfig
+from estimator import profile_dataset, estimate_resources
 from ssh_manager import SSHManager, SSHError
 from vast_api import VastAPI, VastAPIError
 
@@ -23,13 +25,16 @@ _REMOTE_DEPS = (
 class Orchestrator:
     """Coordinates the full lifecycle: rent → setup → train → download → destroy."""
 
-    def __init__(self, config: ExperimentConfig, log_cb: LogCallback = None):
+    def __init__(self, config: ExperimentConfig, log_cb: LogCallback = None,
+                 telemetry_cb: Optional[Callable] = None):
         self.config = config
         self.log_cb = log_cb or (lambda msg: None)
+        self.telemetry_cb = telemetry_cb  # GUI callback for live chart data
         self.vast: Optional[VastAPI] = None
         self.ssh: Optional[SSHManager] = None
         self.instance_id: Optional[int] = None
         self._cancel = threading.Event()
+        self._telemetry_stop = threading.Event()
 
     # ------------------------------------------------------------------
     # Public entry-point (runs in a background thread)
@@ -37,6 +42,9 @@ class Orchestrator:
     def run(self) -> None:
         """Execute the full pipeline. Intended to be called from a thread."""
         try:
+            self._step_estimate()
+            if self._cancelled():
+                return
             self._step_search_and_rent()
             if self._cancelled():
                 return
@@ -79,14 +87,34 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Pipeline steps
     # ------------------------------------------------------------------
+    def _step_estimate(self) -> None:
+        """Step 0: Pre-flight dataset analysis and resource estimation."""
+        self.log_cb("=" * 60)
+        self.log_cb("[0/6] Pre-flight analysis (Smart Estimator)…")
+        profile = profile_dataset(
+            self.config.data_path,
+            task_type=self.config.task_type,
+            log_cb=self.log_cb,
+        )
+        self._dataset_profile = profile
+        self._estimate = estimate_resources(
+            profile,
+            model_name=self.config.model_name,
+            batch_size=self.config.batch_size,
+            epochs=self.config.epochs,
+            gpu_vram_gb=self.config.min_gpu_ram,
+            log_cb=self.log_cb,
+        )
+
     def _step_search_and_rent(self) -> None:
         self.log_cb("=" * 60)
-        self.log_cb("[1/5] Searching for GPU instances on Vast.ai…")
+        self.log_cb("[1/6] Searching for GPU instances on Vast.ai…")
         self.vast = VastAPI(self.config.api_key)
 
         offers = self.vast.search_offers(
             min_gpu_ram=self.config.min_gpu_ram,
             max_price=self.config.max_price,
+            log_cb=self.log_cb,
         )
         if not offers:
             raise VastAPIError(
@@ -98,7 +126,7 @@ class Orchestrator:
         gpu_name = best.get("gpu_name", "unknown")
         price = best.get("dph_total", "?")
         offer_id = best["id"]
-        self.log_cb(f"Best offer: {gpu_name} — ${price}/hr (offer #{offer_id})")
+        self.log_cb(f"Best value: {gpu_name} — ${price}/hr (offer #{offer_id})")
 
         self.log_cb("Renting instance…")
         result = self.vast.create_instance(
@@ -131,7 +159,7 @@ class Orchestrator:
 
     def _step_connect_ssh(self) -> None:
         self.log_cb("=" * 60)
-        self.log_cb("[2/5] Connecting via SSH…")
+        self.log_cb("[2/6] Connecting via SSH…")
         self.ssh = SSHManager(
             host=self._ssh_host,
             port=self._ssh_port,
@@ -141,7 +169,7 @@ class Orchestrator:
 
     def _step_setup_environment(self) -> None:
         self.log_cb("=" * 60)
-        self.log_cb("[3/5] Setting up remote environment…")
+        self.log_cb("[3/6] Setting up remote environment…")
         rc = self.ssh.exec_command(_REMOTE_DEPS, log_cb=self.log_cb)
         if rc != 0:
             raise SSHError(f"Dependency installation failed (exit code {rc})")
@@ -149,12 +177,17 @@ class Orchestrator:
 
     def _step_upload_data(self) -> None:
         self.log_cb("=" * 60)
-        self.log_cb("[4/5] Uploading dataset…")
-        self.ssh.upload_directory(
-            local_path=self.config.data_path,
-            remote_path="/workspace/data",
-            log_cb=self.log_cb,
-        )
+        self.log_cb("[4/6] Uploading dataset…")
+
+        # Try rsync first (resume + checksum), then fall back to tar/SFTP
+        if not self.ssh.upload_rsync(
+            self.config.data_path, "/workspace/data", log_cb=self.log_cb,
+        ):
+            self.ssh.upload_directory(
+                local_path=self.config.data_path,
+                remote_path="/workspace/data",
+                log_cb=self.log_cb,
+            )
 
         # Upload training script
         if self.config.custom_script_path and os.path.isfile(self.config.custom_script_path):
@@ -212,11 +245,14 @@ print("Dataset organized successfully.")
             # Upload separate test data if provided
             if self.config.test_data_path and os.path.isdir(self.config.test_data_path):
                 self.log_cb("Uploading separate test dataset…")
-                self.ssh.upload_directory(
-                    local_path=self.config.test_data_path,
-                    remote_path="/workspace/test_data",
-                    log_cb=self.log_cb,
-                )
+                if not self.ssh.upload_rsync(
+                    self.config.test_data_path, "/workspace/test_data", log_cb=self.log_cb,
+                ):
+                    self.ssh.upload_directory(
+                        local_path=self.config.test_data_path,
+                        remote_path="/workspace/test_data",
+                        log_cb=self.log_cb,
+                    )
                 self.log_cb("Organizing test dataset into class folders…")
                 organize_test = organize_script.replace(
                     'data_dir = "/workspace/data"',
@@ -232,11 +268,14 @@ print("Dataset organized successfully.")
             # Regression — just upload test data if provided (no re-organizing needed)
             if self.config.test_data_path and os.path.isdir(self.config.test_data_path):
                 self.log_cb("Uploading separate test dataset…")
-                self.ssh.upload_directory(
-                    local_path=self.config.test_data_path,
-                    remote_path="/workspace/test_data",
-                    log_cb=self.log_cb,
-                )
+                if not self.ssh.upload_rsync(
+                    self.config.test_data_path, "/workspace/test_data", log_cb=self.log_cb,
+                ):
+                    self.ssh.upload_directory(
+                        local_path=self.config.test_data_path,
+                        remote_path="/workspace/test_data",
+                        log_cb=self.log_cb,
+                    )
 
         # Diagnostic: list final data structure
         self.log_cb("Verifying dataset structure…")
@@ -255,7 +294,7 @@ print("Dataset organized successfully.")
 
     def _step_run_training(self) -> None:
         self.log_cb("=" * 60)
-        self.log_cb("[5/5] Starting training…")
+        self.log_cb("[5/6] Starting training…")
         if self.config.custom_script_path:
             # Custom script — run it directly
             cmd = "cd /workspace && python train.py"
@@ -263,19 +302,61 @@ print("Dataset organized successfully.")
         else:
             cmd = self.config.build_train_command()
         self.log_cb(f"Command: {cmd}")
+
+        # Start telemetry polling in background
+        self._telemetry_stop.clear()
+        telem_thread = threading.Thread(target=self._poll_telemetry, daemon=True)
+        telem_thread.start()
+
         rc = self.ssh.exec_command(cmd, log_cb=self.log_cb)
+
+        # Stop telemetry polling
+        self._telemetry_stop.set()
+        telem_thread.join(timeout=5)
+
         if rc != 0:
             raise SSHError(f"Training script exited with code {rc}")
         self.log_cb("Training completed.")
 
+    def _poll_telemetry(self) -> None:
+        """Periodically download telemetry.csv and feed it to the GUI callback."""
+        if not self.telemetry_cb:
+            return
+
+        import csv
+        import io
+        import tempfile
+
+        local_tmp = os.path.join(tempfile.gettempdir(), "scout_telemetry.csv")
+        remote_csv = "/workspace/output/telemetry.csv"
+
+        while not self._telemetry_stop.is_set():
+            self._telemetry_stop.wait(10)  # poll every 10 seconds
+            if self._telemetry_stop.is_set():
+                break
+            try:
+                self.ssh._sftp.get(remote_csv, local_tmp)
+                with open(local_tmp, newline="") as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                if rows:
+                    self.telemetry_cb(rows)
+            except Exception:
+                pass  # CSV may not exist yet early in training
+
     def _step_download_results(self) -> None:
         self.log_cb("=" * 60)
-        self.log_cb("Downloading results…")
-        self.ssh.download_directory(
-            remote_path="/workspace/output",
-            local_path=self.config.output_path,
-            log_cb=self.log_cb,
-        )
+        self.log_cb("[6/6] Downloading results (Harvest)…")
+
+        # Try rsync first, then tar/SFTP fallback
+        if not self.ssh.download_rsync(
+            "/workspace/output", self.config.output_path, log_cb=self.log_cb,
+        ):
+            self.ssh.download_directory(
+                remote_path="/workspace/output",
+                local_path=self.config.output_path,
+                log_cb=self.log_cb,
+            )
 
     # ------------------------------------------------------------------
     # Instance destruction

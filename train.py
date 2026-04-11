@@ -7,14 +7,16 @@ Regression:
     --target_column specifies which column to predict.
     --feature_columns (comma-sep) specifies input columns (default: all except target).
 
-All results (metrics, plots) are saved as PNG + Excel in output_dir.
+All results (metrics, plots, live telemetry CSV) are saved in output_dir.
 """
 
 import argparse
 import copy
+import csv
 import json
 import os
 import sys
+import time
 
 import matplotlib
 matplotlib.use("Agg")
@@ -110,6 +112,10 @@ def train_classification(args):
     patience_counter = 0
     epoch_metrics = {}
 
+    # ── Live telemetry CSV ──
+    telemetry_fields = ["train_loss", "val_loss", "train_acc", "val_acc"] + list(metric_history.keys())
+    telemetry = LiveTelemetry(args.output_dir, telemetry_fields)
+
     for epoch in range(1, args.epochs + 1):
         # Train
         model.train()
@@ -168,6 +174,12 @@ def train_classification(args):
               f"ValLoss: {val_loss:.4f}  Acc: {val_acc:.4f}  |  {metric_str}")
         sys.stdout.flush()
 
+        # ── Write live telemetry ──
+        telem_row = {"train_loss": train_loss, "val_loss": val_loss,
+                     "train_acc": train_acc, "val_acc": val_acc}
+        telem_row.update(epoch_metrics)
+        telemetry.log_epoch(epoch, telem_row)
+
         if args.early_stopping:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss; patience_counter = 0
@@ -194,13 +206,20 @@ def train_classification(args):
         _plot_roc(all_labels, all_probs, class_names, num_classes, args.output_dir)
     if args.grad_cam:
         try:
-            _generate_gradcam(model, val_loader, device, args.output_dir, class_names)
+            _generate_gradcam(model, val_loader, device, args.output_dir, class_names, num_images=5)
         except Exception as e:
             print(f"Grad-CAM failed: {e}")
 
     # ── Excel export ──
     _export_cls_excel(history, metric_history, epoch_metrics, class_names,
                       all_labels, all_preds, args.output_dir)
+
+    # ── Markdown report ──
+    _generate_report(
+        "classification", args, epoch_metrics, history, args.output_dir,
+        class_names=class_names,
+        extra_info=f"**Dataset:** {len(train_loader.dataset)} train / {len(val_loader.dataset)} test images",
+    )
 
     _print_summary(epoch_metrics, args.output_dir)
 
@@ -282,6 +301,10 @@ def train_regression(args):
     patience_counter = 0
     epoch_metrics = {}
 
+    # ── Live telemetry CSV ──
+    telemetry_fields = ["train_loss", "val_loss"] + list(metric_history.keys())
+    telemetry = LiveTelemetry(args.output_dir, telemetry_fields)
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss, total = 0.0, 0
@@ -323,6 +346,11 @@ def train_regression(args):
         print(f"Epoch {epoch}/{args.epochs}  TrainLoss: {train_loss:.4f}  |  "
               f"ValLoss: {val_loss:.4f}  |  {metric_str}")
         sys.stdout.flush()
+
+        # ── Write live telemetry ──
+        telem_row = {"train_loss": train_loss, "val_loss": val_loss}
+        telem_row.update(epoch_metrics)
+        telemetry.log_epoch(epoch, telem_row)
 
         if args.early_stopping:
             if val_loss < best_val_loss:
@@ -379,6 +407,12 @@ def train_regression(args):
     _export_reg_excel(history, metric_history, epoch_metrics,
                       feature_cols, target_col, all_true, all_pred, args.output_dir)
 
+    # ── Markdown report ──
+    _generate_report(
+        "regression", args, epoch_metrics, history, args.output_dir,
+        extra_info=f"**Target:** `{target_col}`  |  **Features:** {len(feature_cols)}  |  **Samples:** {len(df)}",
+    )
+
     _print_summary(epoch_metrics, args.output_dir)
 
 
@@ -389,6 +423,103 @@ def _build_optimizer(args, model):
     if args.optimizer == "adamw":
         return optim.AdamW(model.parameters(), lr=args.lr)
     return optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+
+
+# ── Live Telemetry CSV ───────────────────────────────────────────────
+class LiveTelemetry:
+    """Writes metrics to a CSV file after each epoch for real-time GUI polling."""
+
+    def __init__(self, output_dir: str, fieldnames: list):
+        self.path = os.path.join(output_dir, "telemetry.csv")
+        self.fieldnames = ["epoch", "timestamp"] + fieldnames
+        with open(self.path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+
+    def log_epoch(self, epoch: int, metrics: dict) -> None:
+        row = {"epoch": epoch, "timestamp": time.time()}
+        row.update(metrics)
+        with open(self.path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(row)
+
+
+# ── Markdown Report ──────────────────────────────────────────────────
+def _generate_report(
+    task_type: str,
+    args,
+    final_metrics: dict,
+    history: dict,
+    output_dir: str,
+    class_names: list = None,
+    extra_info: str = "",
+):
+    """Generate a Markdown report summarising the training run."""
+    path = os.path.join(output_dir, "REPORT.md")
+    lines = [
+        "# SCOUT Training Report",
+        "",
+        f"**Task:** {task_type.title()}",
+        f"**Model:** {args.model}",
+        f"**Optimizer:** {args.optimizer}  |  **LR:** {args.lr}",
+        f"**Batch Size:** {args.batch_size}  |  **Epochs (ran):** {len(history['train_loss'])}",
+        "",
+    ]
+    if class_names:
+        lines.append(f"**Classes ({len(class_names)}):** {', '.join(class_names)}")
+        lines.append("")
+    if extra_info:
+        lines.append(extra_info)
+        lines.append("")
+    # Feature flags
+    flags = []
+    if args.early_stopping:
+        flags.append(f"Early Stopping (patience={args.patience})")
+    if args.lr_scheduler:
+        flags.append("Cosine LR Scheduler")
+    if getattr(args, "grad_cam", False):
+        flags.append("Grad-CAM")
+    if getattr(args, "mixup", False):
+        flags.append("Mixup Augmentation")
+    if getattr(args, "label_smoothing", False):
+        flags.append("Label Smoothing (0.1)")
+    if flags:
+        lines.append("**Flags:** " + ", ".join(flags))
+        lines.append("")
+
+    # Final metrics table
+    lines.append("## Final Metrics")
+    lines.append("")
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    for k, v in final_metrics.items():
+        lines.append(f"| {k} | {v:.4f} |")
+    lines.append("")
+
+    # Training summary
+    lines.append("## Training Summary")
+    lines.append("")
+    lines.append(f"- **Best val loss:** {min(history['val_loss']):.4f}")
+    if "val_acc" in history:
+        lines.append(f"- **Best val accuracy:** {max(history['val_acc']):.4f}")
+    lines.append(f"- **Final train loss:** {history['train_loss'][-1]:.4f}")
+    lines.append("")
+
+    # Output files
+    lines.append("## Output Files")
+    lines.append("")
+    output_files = sorted(os.listdir(output_dir))
+    for f in output_files:
+        size_kb = os.path.getsize(os.path.join(output_dir, f)) / 1024
+        icon = "📊" if f.endswith(".png") else "📦" if f.endswith(".pth") else "📄"
+        lines.append(f"- {icon} `{f}` ({size_kb:.0f} KB)")
+    lines.append("")
+    lines.append("---")
+    lines.append("*Generated by SCOUT — Vast.ai Training Orchestrator*")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"Report saved: {path}")
 
 
 def _print_summary(metrics_dict, output_dir):

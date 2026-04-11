@@ -2,11 +2,13 @@
 
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from vastai import VastAI
 
 logger = logging.getLogger(__name__)
+
+LogCallback = Optional[Callable[[str], None]]
 
 
 class VastAPIError(Exception):
@@ -31,8 +33,17 @@ class VastAPI:
         min_gpu_ram: float = 8.0,
         max_price: float = 1.0,
         gpu_name: Optional[str] = None,
+        min_reliability: float = 0.95,
+        min_dl_speed: float = 100.0,
+        min_ul_speed: float = 50.0,
+        log_cb: LogCallback = None,
     ) -> List[Dict[str, Any]]:
-        """Search for available GPU instances matching criteria."""
+        """Search for available GPU offers, scored by best value.
+
+        Filters by reliability and network speed, then ranks by a composite
+        ''value score'' that balances price, GPU performance, and connectivity
+        rather than sorting by lowest price alone.
+        """
         query = f"gpu_ram>={min_gpu_ram} dph_total<={max_price} rentable=true"
         if gpu_name:
             query += f" gpu_name={gpu_name}"
@@ -46,9 +57,61 @@ class VastAPI:
         except Exception as exc:
             raise VastAPIError(f"search_offers failed: {exc}") from exc
 
-        if isinstance(result, list):
-            return result
-        return []
+        if not isinstance(result, list):
+            return []
+
+        # ── Filter unreliable / slow machines ──
+        filtered = []
+        for offer in result:
+            reliability = offer.get("reliability2", offer.get("reliability", 1.0)) or 1.0
+            dl_speed = offer.get("inet_down", 0) or 0       # Mbps
+            ul_speed = offer.get("inet_up", 0) or 0         # Mbps
+
+            if reliability < min_reliability:
+                continue
+            if dl_speed < min_dl_speed:
+                continue
+            if ul_speed < min_ul_speed:
+                continue
+            filtered.append(offer)
+
+        if log_cb:
+            log_cb(f"Offers: {len(result)} total → {len(filtered)} after reliability/speed filter")
+
+        # ── Score remaining offers ──
+        # Value = GPU_performance × Network_speed / Price
+        # Higher is better.
+        for offer in filtered:
+            gpu_ram = offer.get("gpu_ram", 8) or 8
+            dl = offer.get("inet_down", 100) or 100
+            ul = offer.get("inet_up", 50) or 50
+            price = offer.get("dph_total", 1.0) or 1.0
+            reliability = offer.get("reliability2", offer.get("reliability", 0.95)) or 0.95
+            dlperf = offer.get("dlperf", 5) or 5  # deep learning perf score
+
+            # Composite score (higher = better value for a short sprint)
+            offer["_value_score"] = (
+                (dlperf * 2.0)           # GPU compute perf (most important)
+                * (gpu_ram / 8.0)        # VRAM bonus
+                * reliability            # uptime reliability
+                * min(dl + ul, 2000) / 500  # network throughput factor
+                / max(price, 0.01)       # cost efficiency
+            )
+
+        # Sort by value score descending (best value first)
+        filtered.sort(key=lambda o: o.get("_value_score", 0), reverse=True)
+
+        if log_cb and filtered:
+            top = filtered[0]
+            log_cb(
+                f"Top pick: {top.get('gpu_name', '?')} "
+                f"({top.get('gpu_ram', '?')} GB) — "
+                f"${top.get('dph_total', '?')}/hr — "
+                f"score {top['_value_score']:.1f} — "
+                f"reliability {top.get('reliability2', top.get('reliability', '?')):.0%}"
+            )
+
+        return filtered
 
     def create_instance(
         self,

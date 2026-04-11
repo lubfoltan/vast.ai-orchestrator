@@ -13,12 +13,13 @@
 
 <script setup>
 const modules = [
-  { file: 'gui.py', role: 'Desktop GUI — config panel, log viewer, SSH console' },
+  { file: 'gui.py', role: 'Desktop GUI — config panel, log viewer, live chart, SSH console' },
   { file: 'config.py', role: 'Dataclass holding all experiment parameters' },
-  { file: 'orchestrator.py', role: '5-step pipeline controller' },
-  { file: 'vast_api.py', role: 'Vast.ai SDK wrapper — search, create, stop, destroy' },
-  { file: 'ssh_manager.py', role: 'Paramiko SSH/SFTP — exec, upload, download' },
-  { file: 'train.py', role: 'Remote training script (classification + regression)' },
+  { file: 'orchestrator.py', role: '7-step pipeline controller with telemetry polling' },
+  { file: 'estimator.py', role: 'Smart Estimator — dataset profiling & resource estimation' },
+  { file: 'vast_api.py', role: 'Vast.ai SDK — search (value-scored), create, stop, destroy' },
+  { file: 'ssh_manager.py', role: 'Paramiko SSH/SFTP + rsync, tar-based bulk transfers' },
+  { file: 'train.py', role: 'Remote training (classification CNN + regression MLP + telemetry)' },
 ]
 </script>
 

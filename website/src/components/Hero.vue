@@ -2,9 +2,10 @@
   <section class="hero">
     <div class="hero-inner">
       <span class="badge badge-blue">Open Source</span>
-      <h1>Vast.ai Training<br><span class="gradient">Orchestrator</span></h1>
+      <h1>SCOUT<br><span class="gradient">Training Orchestrator</span></h1>
+      <p class="tagline">Configure. Deploy. Harvest.</p>
       <p class="hero-sub">
-        One-click ML training on cloud GPUs. Desktop GUI that rents a
+        One-click ML training on cloud GPUs. Desktop app that rents a
         <a href="https://vast.ai" target="_blank">Vast.ai</a> instance, uploads
         your data, trains, and downloads results&nbsp;&mdash; fully automated.
       </p>
@@ -32,6 +33,7 @@
 h1{font-size:clamp(2.4rem,5vw,3.8rem);font-weight:800;line-height:1.15;margin:16px 0 20px}
 .gradient{background:linear-gradient(135deg,var(--accent),var(--accent3));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .hero-sub{font-size:1.15rem;color:var(--muted);max-width:560px;margin:0 auto 32px}
+.tagline{font-size:1.3rem;font-weight:600;color:var(--accent3);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
 .hero-buttons{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:10px;font-weight:600;font-size:.95rem;transition:all .2s}
 .btn-primary{background:var(--accent);color:#fff}

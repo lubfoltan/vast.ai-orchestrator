@@ -14,15 +14,15 @@
 
 <script setup>
 const features = [
-  { icon: '🖥️', title: 'Desktop GUI', desc: 'Dark-mode CustomTkinter interface with scrollable config, real-time logs, and SSH console.' },
-  { icon: '⚡', title: 'One-Click Pipeline', desc: 'Rent GPU → upload data → train → download results. Fully automated 5-step pipeline.' },
-  { icon: '🔀', title: 'Classification & Regression', desc: 'Switch between image classification (CNN) and tabular regression (MLP) with a single toggle.' },
-  { icon: '📊', title: '17 Metrics', desc: '10 classification metrics (AUC, F1, Cohen\'s Kappa…) and 7 regression metrics (RMSE, R², MAPE…).' },
-  { icon: '📜', title: 'Custom Scripts', desc: 'Upload and run your own training script instead of the built-in one — full flexibility.' },
-  { icon: '🔑', title: 'SSH Key Auth', desc: 'Authenticate with SSH key or password. Interactive SSH console available in the GUI.' },
-  { icon: '📁', title: 'Auto-Organize', desc: 'Flat folder of images? Regex-based auto-organize sorts them into class sub-folders.' },
-  { icon: '📈', title: 'Excel Reports', desc: 'Results exported to results.xlsx with epoch history, final metrics, and prediction sheets.' },
-  { icon: '🎛️', title: 'Training Flags', desc: 'Early stopping, LR scheduler, Mixup augmentation, label smoothing, Grad-CAM — all toggleable.' },
+  { icon: '🧠', title: 'Smart Estimator', desc: 'Pre-flight analysis of your dataset — estimates VRAM needs, training time, and detects class imbalance before you spend a penny.' },
+  { icon: '⚡', title: 'Dynamic Provisioning', desc: 'Scores GPUs by value — factors in reliability, network speed, and DL performance, not just price.' },
+  { icon: '📈', title: 'Live Telemetry', desc: 'Real-time Loss/Accuracy charts in the GUI via periodic CSV polling. No W&B dependency needed.' },
+  { icon: '🔄', title: 'Rsync Pipeline', desc: 'Resume-capable, checksum-verified file transfers. Falls back to tar+gzip → SFTP automatically.' },
+  { icon: '🔬', title: 'Automated Grad-CAM', desc: 'Generates 5 Class Activation Map heatmaps after training — shows what the model sees, not just numbers.' },
+  { icon: '🔀', title: 'Classification & Regression', desc: 'Image classification with pretrained CNNs or tabular regression with MLP — switch with a toggle.' },
+  { icon: '📊', title: '17 Metrics + Reports', desc: '10 classification + 7 regression metrics. Auto-generated REPORT.md and Excel with history, metrics, and predictions.' },
+  { icon: '📜', title: 'Custom Scripts', desc: 'Upload and run your own training script instead of the built-in one — full flexibility with guided documentation.' },
+  { icon: '🎛️', title: 'Training Flags', desc: 'Early stopping, LR scheduler, Mixup augmentation, label smoothing, Grad-CAM — all toggleable from the GUI.' },
 ]
 </script>
 

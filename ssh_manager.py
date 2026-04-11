@@ -2,7 +2,11 @@
 
 import logging
 import os
+import shutil
 import stat
+import subprocess
+import tarfile
+import tempfile
 import time
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
@@ -193,13 +197,98 @@ class SSHManager:
         remote_path: str,
         log_cb: LogCallback = None,
     ) -> None:
-        """Recursively upload a local directory to the remote server."""
+        """Recursively upload a local directory to the remote server.
+
+        Uses tar+gzip compression for speed: creates a local archive,
+        uploads the single file, and extracts remotely. Falls back to
+        per-file SFTP if tar extraction fails.
+        """
         self._ensure_connected()
         local = Path(local_path)
         if not local.is_dir():
             raise SSHError(f"Local path is not a directory: {local_path}")
 
-        # Count files for progress
+        all_files = [f for f in local.rglob("*") if f.is_file()]
+        total = len(all_files)
+        if total == 0:
+            if log_cb:
+                log_cb("No files to upload.")
+            return
+
+        if log_cb:
+            log_cb(f"Packing {total} files into archive…")
+
+        # Create tar.gz archive in a temp file
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            with tarfile.open(tmp_path, "w:gz") as tar:
+                for file in all_files:
+                    arcname = file.relative_to(local).as_posix()
+                    tar.add(str(file), arcname=arcname)
+
+            archive_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+            if log_cb:
+                log_cb(f"Archive: {archive_size_mb:.1f} MB ({total} files compressed)")
+
+            # Upload the single archive
+            self._remote_mkdir_p(remote_path)
+            remote_archive = f"{remote_path}/_upload.tar.gz"
+            if log_cb:
+                log_cb(f"Uploading archive → {remote_path}…")
+            self._sftp.put(tmp_path, remote_archive, callback=self._make_progress_cb(log_cb, archive_size_mb))
+
+            # Extract remotely and clean up
+            if log_cb:
+                log_cb("Extracting on remote server…")
+            rc = self.exec_command(
+                f"cd {remote_path} && tar xzf _upload.tar.gz && rm _upload.tar.gz",
+                log_cb=log_cb,
+            )
+            if rc != 0:
+                raise SSHError("Remote tar extraction failed")
+
+            if log_cb:
+                log_cb(f"Upload complete: {total} files transferred.")
+
+        except Exception as exc:
+            # Fallback to per-file upload
+            if log_cb:
+                log_cb(f"Fast upload failed ({exc}), falling back to per-file SFTP…")
+            self._upload_directory_sftp(local_path, remote_path, log_cb)
+        finally:
+            # Clean up temp archive
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _make_progress_cb(log_cb: LogCallback, total_mb: float):
+        """Return a paramiko progress callback that logs every ~10%."""
+        if not log_cb or total_mb < 1:
+            return None
+        total_bytes = int(total_mb * 1024 * 1024)
+        last_pct = [-1]  # mutable for closure
+
+        def _progress(transferred: int, total: int) -> None:
+            pct = int(transferred / total * 100) if total else 0
+            # Log at every 10% step
+            if pct // 10 > last_pct[0] // 10:
+                last_pct[0] = pct
+                mb_done = transferred / (1024 * 1024)
+                log_cb(f"  ↑ {mb_done:.1f} / {total_mb:.1f} MB ({pct}%)")
+        return _progress
+
+    def _upload_directory_sftp(
+        self,
+        local_path: str,
+        remote_path: str,
+        log_cb: LogCallback = None,
+    ) -> None:
+        """Fallback: recursively upload a local directory file-by-file via SFTP."""
+        local = Path(local_path)
         all_files = [f for f in local.rglob("*") if f.is_file()]
         total = len(all_files)
         if log_cb:
@@ -227,7 +316,11 @@ class SSHManager:
         local_path: str,
         log_cb: LogCallback = None,
     ) -> None:
-        """Recursively download a remote directory to a local path."""
+        """Recursively download a remote directory to a local path.
+
+        Uses tar+gzip: archives remotely, downloads one file, extracts locally.
+        Falls back to per-file SFTP on failure.
+        """
         self._ensure_connected()
         local = Path(local_path)
         local.mkdir(parents=True, exist_ok=True)
@@ -235,10 +328,44 @@ class SSHManager:
         if log_cb:
             log_cb(f"Downloading {remote_path} → {local_path}")
 
-        self._download_recursive(remote_path, local, log_cb)
+        try:
+            # Create archive on remote
+            remote_archive = f"{remote_path}/_download.tar.gz"
+            if log_cb:
+                log_cb("Packing results on remote server…")
+            rc = self.exec_command(
+                f"cd {remote_path} && tar czf _download.tar.gz --exclude=_download.tar.gz .",
+                log_cb=log_cb,
+            )
+            if rc != 0:
+                raise SSHError("Remote tar packing failed")
 
-        if log_cb:
-            log_cb("Download complete.")
+            # Download single archive
+            tmp_path = os.path.join(tempfile.gettempdir(), "_download.tar.gz")
+            if log_cb:
+                log_cb("Downloading archive…")
+            self._sftp.get(remote_archive, tmp_path)
+
+            # Clean up remote archive
+            self.exec_command(f"rm -f {remote_archive}")
+
+            # Extract locally
+            archive_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+            if log_cb:
+                log_cb(f"Extracting archive ({archive_size_mb:.1f} MB)…")
+            with tarfile.open(tmp_path, "r:gz") as tar:
+                tar.extractall(path=str(local), filter="data")
+
+            os.unlink(tmp_path)
+            if log_cb:
+                log_cb("Download complete.")
+
+        except Exception as exc:
+            if log_cb:
+                log_cb(f"Fast download failed ({exc}), falling back to per-file SFTP…")
+            self._download_recursive(remote_path, local, log_cb)
+            if log_cb:
+                log_cb("Download complete.")
 
     def _download_recursive(
         self,
@@ -264,3 +391,126 @@ class SSHManager:
         remote_dir = str(PurePosixPath(remote_file).parent)
         self._remote_mkdir_p(remote_dir)
         self._sftp.put(local_file, remote_file)
+
+    # ------------------------------------------------------------------
+    # Rsync-based transfer (resume + checksum)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _has_rsync() -> bool:
+        """Check if rsync is available locally."""
+        return shutil.which("rsync") is not None
+
+    def upload_rsync(
+        self,
+        local_path: str,
+        remote_path: str,
+        log_cb: LogCallback = None,
+    ) -> bool:
+        """Upload via rsync over SSH. Returns True on success.
+
+        Rsync provides:
+        - Resume on interruption (--partial)
+        - Checksum verification (--checksum)
+        - Compression during transfer (-z)
+        - Delta transfer (only changed bytes for re-uploads)
+        """
+        if not self._has_rsync():
+            if log_cb:
+                log_cb("rsync not found locally — falling back to tar upload.")
+            return False
+
+        ssh_cmd = f"ssh -p {self.port} -o StrictHostKeyChecking=no"
+        if self.key_filename:
+            ssh_cmd += f" -i {self.key_filename}"
+
+        # Ensure trailing slash to sync contents (not the dir itself into a subdir)
+        src = local_path.rstrip("/\\") + "/"
+        dst = f"{self.username}@{self.host}:{remote_path}/"
+
+        cmd = [
+            "rsync", "-avz",
+            "--partial", "--progress", "--checksum",
+            "-e", ssh_cmd,
+            src, dst,
+        ]
+
+        if log_cb:
+            log_cb(f"Rsync: {src} → {dst}")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line and log_cb:
+                    log_cb(f"  [rsync] {line}")
+            rc = proc.wait()
+            if rc != 0:
+                if log_cb:
+                    log_cb(f"rsync exited with code {rc}")
+                return False
+            if log_cb:
+                log_cb("Rsync upload complete.")
+            return True
+        except Exception as exc:
+            if log_cb:
+                log_cb(f"rsync error: {exc}")
+            return False
+
+    def download_rsync(
+        self,
+        remote_path: str,
+        local_path: str,
+        log_cb: LogCallback = None,
+    ) -> bool:
+        """Download via rsync over SSH. Returns True on success."""
+        if not self._has_rsync():
+            if log_cb:
+                log_cb("rsync not found locally — falling back to tar download.")
+            return False
+
+        ssh_cmd = f"ssh -p {self.port} -o StrictHostKeyChecking=no"
+        if self.key_filename:
+            ssh_cmd += f" -i {self.key_filename}"
+
+        src = f"{self.username}@{self.host}:{remote_path}/"
+        dst = local_path.rstrip("/\\") + "/"
+        os.makedirs(dst, exist_ok=True)
+
+        cmd = [
+            "rsync", "-avz",
+            "--partial", "--progress", "--checksum",
+            "-e", ssh_cmd,
+            src, dst,
+        ]
+
+        if log_cb:
+            log_cb(f"Rsync: {src} → {dst}")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line and log_cb:
+                    log_cb(f"  [rsync] {line}")
+            rc = proc.wait()
+            if rc != 0:
+                if log_cb:
+                    log_cb(f"rsync exited with code {rc}")
+                return False
+            if log_cb:
+                log_cb("Rsync download complete.")
+            return True
+        except Exception as exc:
+            if log_cb:
+                log_cb(f"rsync error: {exc}")
+            return False

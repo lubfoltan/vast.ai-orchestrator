@@ -1,7 +1,7 @@
 <template>
   <section class="section">
     <h2 class="section-title">How It Works</h2>
-    <p class="section-sub">Five steps from config to trained model.</p>
+    <p class="section-sub">Six steps from config to trained model.</p>
     <div class="steps">
       <div class="step" v-for="(s, i) in steps" :key="i">
         <div class="step-num">{{ i + 1 }}</div>
@@ -16,11 +16,12 @@
 
 <script setup>
 const steps = [
-  { title: 'Configure', desc: 'Set your API key, dataset path, model, epochs, metrics, and training flags in the GUI.' },
-  { title: 'Rent a GPU', desc: 'The orchestrator searches Vast.ai for the cheapest GPU matching your filters and creates an instance.' },
-  { title: 'Upload Data', desc: 'Your dataset (images or CSV) is uploaded via SFTP. Flat folders are auto-organized into classes.' },
-  { title: 'Train', desc: 'Training runs remotely with live log streaming. Classification uses pretrained CNNs, regression uses MLP.' },
-  { title: 'Download Results', desc: 'Model weights, plots, metrics, and Excel report are downloaded. Instance is stopped or destroyed.' },
+  { title: 'Estimate', desc: 'Smart Estimator scans your dataset — file count, size, class balance — and estimates VRAM needs and training time.' },
+  { title: 'Provision', desc: 'Dynamic scoring finds the best-value GPU — filters by reliability, network speed, and compute power, not just price.' },
+  { title: 'Upload', desc: 'Dataset transferred via rsync (resume + checksum). Falls back to tar+gzip archive for maximum compatibility.' },
+  { title: 'Train', desc: 'Training runs remotely with live log streaming and a real-time Loss/Accuracy chart in the GUI.' },
+  { title: 'Interpret', desc: 'Grad-CAM heatmaps generated automatically. REPORT.md and results.xlsx created on the server.' },
+  { title: 'Harvest', desc: 'Model weights, plots, metrics, Excel report, and Markdown report downloaded. Instance destroyed to stop billing.' },
 ]
 </script>
 

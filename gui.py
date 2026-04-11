@@ -1,5 +1,6 @@
-"""CustomTkinter GUI for the X-Ray Training Orchestrator."""
+"""SCOUT — Desktop GUI for Vast.ai Training Orchestrator."""
 
+import csv
 import os
 import threading
 import time
@@ -11,6 +12,15 @@ import customtkinter as ctk
 
 from config import ExperimentConfig
 from orchestrator import Orchestrator
+
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
 
 
 ctk.set_appearance_mode("dark")
@@ -25,7 +35,7 @@ class App(ctk.CTk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("X-Ray Training Orchestrator — Vast.ai")
+        self.title("SCOUT — Vast.ai Training Orchestrator")
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.minsize(1050, 800)
 
@@ -48,17 +58,17 @@ class App(ctk.CTk):
         config_scroll.grid_columnconfigure(0, weight=1)
         self._build_config_panel(config_scroll)
 
-        # --- Middle: log console ---
-        log_frame = ctk.CTkFrame(self)
-        log_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
-        log_frame.grid_rowconfigure(0, weight=1)
-        log_frame.grid_columnconfigure(0, weight=1)
+        # --- Middle: log console + telemetry chart ---
+        mid_frame = ctk.CTkFrame(self)
+        mid_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
+        mid_frame.grid_rowconfigure(0, weight=1)
+        mid_frame.grid_columnconfigure(0, weight=1)
 
-        self.log_box = ctk.CTkTextbox(log_frame, state="disabled", font=("Consolas", 12))
+        self.log_box = ctk.CTkTextbox(mid_frame, state="disabled", font=("Consolas", 12))
         self.log_box.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
 
         # SSH input bar (hidden by default)
-        self.ssh_input_frame = ctk.CTkFrame(log_frame)
+        self.ssh_input_frame = ctk.CTkFrame(mid_frame)
         self.ssh_input_var = ctk.StringVar()
         ctk.CTkLabel(self.ssh_input_frame, text="SSH >", font=("Consolas", 12)).pack(side="left", padx=(5, 2))
         self.ssh_input_entry = ctk.CTkEntry(
@@ -71,6 +81,24 @@ class App(ctk.CTk):
         ctk.CTkButton(self.ssh_input_frame, text="Exit Console", width=90,
                        fg_color="gray", command=self._on_ssh_exit).pack(side="left", padx=(2, 5))
         # NOT gridded yet — shown only when SSH Console is activated
+
+        # Live telemetry chart (hidden by default)
+        self._chart_visible = False
+        self._chart_frame = ctk.CTkFrame(mid_frame)
+        if _HAS_MATPLOTLIB:
+            self._fig = Figure(figsize=(8, 2.5), dpi=80, facecolor="#1a1a2e")
+            self._ax_loss = self._fig.add_subplot(121)
+            self._ax_acc = self._fig.add_subplot(122)
+            for ax in (self._ax_loss, self._ax_acc):
+                ax.set_facecolor("#1a1a2e")
+                ax.tick_params(colors="white", labelsize=7)
+                for spine in ax.spines.values():
+                    spine.set_color("#333")
+            self._ax_loss.set_title("Loss", color="white", fontsize=9)
+            self._ax_acc.set_title("Accuracy / Metric", color="white", fontsize=9)
+            self._fig.tight_layout(pad=1.5)
+            self._canvas = FigureCanvasTkAgg(self._fig, master=self._chart_frame)
+            self._canvas.get_tk_widget().pack(fill="both", expand=True)
 
         # --- Bottom: action buttons ---
         btn_frame = ctk.CTkFrame(self)
@@ -298,7 +326,7 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------------
     def _build_buttons(self, parent: ctk.CTkFrame) -> None:
-        parent.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
+        parent.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
 
         self.btn_start = ctk.CTkButton(parent, text="▶  Start Pipeline", command=self._on_start, fg_color="green")
         self.btn_start.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
@@ -316,8 +344,14 @@ class App(ctk.CTk):
         )
         self.btn_ssh_console.grid(row=0, column=3, padx=8, pady=8, sticky="ew")
 
+        self.btn_chart = ctk.CTkButton(
+            parent, text="📈  Live Chart", command=self._on_toggle_chart,
+            state="normal" if _HAS_MATPLOTLIB else "disabled"
+        )
+        self.btn_chart.grid(row=0, column=4, padx=8, pady=8, sticky="ew")
+
         self.btn_clear = ctk.CTkButton(parent, text="Clear Log", command=self._clear_log)
-        self.btn_clear.grid(row=0, column=4, padx=8, pady=8, sticky="ew")
+        self.btn_clear.grid(row=0, column=5, padx=8, pady=8, sticky="ew")
 
     # ==================================================================
     # Helpers
@@ -448,7 +482,10 @@ class App(ctk.CTk):
             return
 
         cfg = self._build_config()
-        self._orchestrator = Orchestrator(cfg, log_cb=self._append_log)
+        self._orchestrator = Orchestrator(
+            cfg, log_cb=self._append_log,
+            telemetry_cb=self._on_telemetry_data,
+        )
 
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
@@ -491,6 +528,76 @@ class App(ctk.CTk):
         self._orchestrator.destroy_instance()
         self.after(0, lambda: self.btn_destroy.configure(state="disabled"))
         self.after(0, lambda: self.btn_ssh_console.configure(state="disabled"))
+
+    # ==================================================================
+    # Live Telemetry Chart
+    # ==================================================================
+    def _on_toggle_chart(self) -> None:
+        """Show/hide the live training chart."""
+        if not _HAS_MATPLOTLIB:
+            return
+        if self._chart_visible:
+            self._chart_frame.grid_remove()
+            self._chart_visible = False
+            self.btn_chart.configure(text="📈  Live Chart")
+        else:
+            self._chart_frame.grid(row=2, column=0, padx=5, pady=(0, 5), sticky="nsew")
+            self._chart_visible = True
+            self.btn_chart.configure(text="📈  Hide Chart")
+
+    def _on_telemetry_data(self, rows: list) -> None:
+        """Called by orchestrator with parsed telemetry CSV rows. Thread-safe via after()."""
+        self.after(0, self._update_chart, rows)
+
+    def _update_chart(self, rows: list) -> None:
+        """Redraw the live chart with latest telemetry data."""
+        if not _HAS_MATPLOTLIB or not rows:
+            return
+
+        epochs = [int(r.get("epoch", 0)) for r in rows]
+        train_loss = [float(r.get("train_loss", 0)) for r in rows]
+        val_loss = [float(r.get("val_loss", 0)) for r in rows]
+
+        self._ax_loss.clear()
+        self._ax_loss.plot(epochs, train_loss, "c-", linewidth=1.2, label="Train")
+        self._ax_loss.plot(epochs, val_loss, "r-", linewidth=1.2, label="Val")
+        self._ax_loss.set_title("Loss", color="white", fontsize=9)
+        self._ax_loss.legend(fontsize=7, facecolor="#1a1a2e", edgecolor="#333", labelcolor="white")
+        self._ax_loss.tick_params(colors="white", labelsize=7)
+
+        self._ax_acc.clear()
+        # Plot accuracy if available, otherwise first non-loss metric
+        if "val_acc" in rows[0]:
+            train_acc = [float(r.get("train_acc", 0)) for r in rows]
+            val_acc = [float(r.get("val_acc", 0)) for r in rows]
+            self._ax_acc.plot(epochs, train_acc, "c-", linewidth=1.2, label="Train Acc")
+            self._ax_acc.plot(epochs, val_acc, "r-", linewidth=1.2, label="Val Acc")
+            self._ax_acc.set_title("Accuracy", color="white", fontsize=9)
+        else:
+            # Plot whatever metric columns exist (skip epoch, timestamp, losses)
+            skip = {"epoch", "timestamp", "train_loss", "val_loss"}
+            plotted = 0
+            colors = ["#22d3ee", "#f472b6", "#a78bfa", "#34d399", "#fbbf24"]
+            for key in rows[0]:
+                if key in skip or plotted >= 3:
+                    continue
+                try:
+                    vals = [float(r.get(key, 0)) for r in rows]
+                    self._ax_acc.plot(epochs, vals, color=colors[plotted % len(colors)],
+                                     linewidth=1.2, label=key.upper())
+                    plotted += 1
+                except (ValueError, TypeError):
+                    pass
+            self._ax_acc.set_title("Metrics", color="white", fontsize=9)
+
+        self._ax_acc.legend(fontsize=7, facecolor="#1a1a2e", edgecolor="#333", labelcolor="white")
+        self._ax_acc.tick_params(colors="white", labelsize=7)
+        self._fig.tight_layout(pad=1.5)
+        self._canvas.draw_idle()
+
+        # Auto-show chart on first data
+        if not self._chart_visible:
+            self._on_toggle_chart()
 
     # ==================================================================
     # Interactive SSH Console
