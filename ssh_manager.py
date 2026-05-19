@@ -2,6 +2,7 @@
 
 import logging
 import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -11,11 +12,26 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
+import shlex
+
 import paramiko
 
 logger = logging.getLogger(__name__)
 
+# Tuned transport defaults — paramiko's stock 32 KB window cripples throughput
+# on high-latency links. 128 MB window + 32 KB packets ≈ saturates a 1 Gbps link.
+_SSH_WINDOW_SIZE = 128 * 1024 * 1024  # 128 MB
+_SSH_MAX_PACKET = 32 * 1024  # 32 KB (paramiko hard cap)
+
 LogCallback = Optional[Callable[[str], None]]
+
+
+def _flatten(tree: list) -> list:
+    """Flatten a nested file-tree list into a single list of entries."""
+    for node in tree:
+        yield node
+        if node.get("children"):
+            yield from _flatten(node["children"])
 
 
 class SSHError(Exception):
@@ -33,7 +49,8 @@ class SSHManager:
         key_filename: Optional[str] = None,
         password: Optional[str] = None,
         connect_timeout: int = 30,
-        max_retries: int = 3,
+        banner_timeout: int = 60,
+        max_retries: int = 12,
     ):
         self.host = host
         self.port = port
@@ -41,6 +58,7 @@ class SSHManager:
         self.key_filename = key_filename
         self.password = password
         self.connect_timeout = connect_timeout
+        self.banner_timeout = banner_timeout
         self.max_retries = max_retries
         self._client: Optional[paramiko.SSHClient] = None
         self._sftp: Optional[paramiko.SFTPClient] = None
@@ -63,6 +81,7 @@ class SSHManager:
                     "port": self.port,
                     "username": self.username,
                     "timeout": self.connect_timeout,
+                    "banner_timeout": self.banner_timeout,
                     "allow_agent": False,
                     "look_for_keys": False,
                 }
@@ -72,6 +91,18 @@ class SSHManager:
                     kwargs["password"] = self.password
 
                 self._client.connect(**kwargs)
+                # Tune transport window/packet sizes BEFORE opening any channels —
+                # paramiko's default 32 KB window is the main reason SFTP feels slow.
+                transport = self._client.get_transport()
+                if transport is not None:
+                    try:
+                        transport.default_window_size = _SSH_WINDOW_SIZE
+                        transport.default_max_packet_size = _SSH_MAX_PACKET
+                        # Disable rekey churn on long large transfers
+                        transport.packetizer.REKEY_BYTES = pow(2, 40)
+                        transport.packetizer.REKEY_PACKETS = pow(2, 40)
+                    except Exception:
+                        pass
                 self._sftp = self._client.open_sftp()
                 if log_cb:
                     log_cb("SSH connected successfully.")
@@ -81,7 +112,10 @@ class SSHManager:
                 if log_cb:
                     log_cb(f"SSH attempt {attempt} failed: {exc}")
                 if attempt < self.max_retries:
-                    time.sleep(5 * attempt)
+                    wait = min(15 * attempt, 90)  # 15s, 30s, 45s … capped at 90s
+                    if log_cb:
+                        log_cb(f"Retrying in {wait}s (instance may still be booting)…")
+                    time.sleep(wait)
 
         raise SSHError(f"Failed to connect after {self.max_retries} attempts: {last_err}")
 
@@ -199,9 +233,14 @@ class SSHManager:
     ) -> None:
         """Recursively upload a local directory to the remote server.
 
-        Uses tar+gzip compression for speed: creates a local archive,
-        uploads the single file, and extracts remotely. Falls back to
-        per-file SFTP if tar extraction fails.
+        Strategy (fastest → slowest fallback):
+          1. **Streaming tar over SSH exec** — pipes an uncompressed tar stream
+             directly into ``tar -xf -`` on the remote. No intermediate archive
+             file, no gzip cost (images don't compress), no SFTP window stalls.
+             Typically 5–15× faster than SFTP for image datasets.
+          2. **tar.gz staged via SFTP** — old path, kept as a safety net if
+             streaming exec fails (e.g. remote tar missing, channel closed).
+          3. **Per-file SFTP** — last resort.
         """
         self._ensure_connected()
         local = Path(local_path)
@@ -215,14 +254,30 @@ class SSHManager:
                 log_cb("No files to upload.")
             return
 
+        total_bytes = sum(f.stat().st_size for f in all_files)
+        total_mb = total_bytes / (1024 * 1024)
         if log_cb:
-            log_cb(f"Packing {total} files into archive…")
+            log_cb(f"Uploading {total} files ({total_mb:.1f} MB) → {remote_path}")
+            log_cb("Using streaming tar (uncompressed, direct pipe)…")
 
-        # Create tar.gz archive in a temp file
+        # ---- Primary: streaming tar over exec ---------------------------------
+        try:
+            self._remote_mkdir_p(remote_path)
+            self._upload_directory_streaming_tar(
+                local, remote_path, all_files, total_bytes, log_cb
+            )
+            if log_cb:
+                log_cb(f"Upload complete: {total} files transferred.")
+            return
+        except Exception as exc:
+            if log_cb:
+                log_cb(f"Streaming tar failed ({exc}), falling back to staged tar.gz…")
+
+        # ---- Fallback 1: staged tar.gz via SFTP -------------------------------
+        tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
                 tmp_path = tmp.name
-
             with tarfile.open(tmp_path, "w:gz") as tar:
                 for file in all_files:
                     arcname = file.relative_to(local).as_posix()
@@ -231,15 +286,14 @@ class SSHManager:
             archive_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
             if log_cb:
                 log_cb(f"Archive: {archive_size_mb:.1f} MB ({total} files compressed)")
-
-            # Upload the single archive
-            self._remote_mkdir_p(remote_path)
             remote_archive = f"{remote_path}/_upload.tar.gz"
             if log_cb:
                 log_cb(f"Uploading archive → {remote_path}…")
-            self._sftp.put(tmp_path, remote_archive, callback=self._make_progress_cb(log_cb, archive_size_mb))
-
-            # Extract remotely and clean up
+            self._sftp.put(
+                tmp_path,
+                remote_archive,
+                callback=self._make_progress_cb(log_cb, archive_size_mb),
+            )
             if log_cb:
                 log_cb("Extracting on remote server…")
             rc = self.exec_command(
@@ -248,21 +302,122 @@ class SSHManager:
             )
             if rc != 0:
                 raise SSHError("Remote tar extraction failed")
-
             if log_cb:
                 log_cb(f"Upload complete: {total} files transferred.")
-
+            return
         except Exception as exc:
-            # Fallback to per-file upload
             if log_cb:
-                log_cb(f"Fast upload failed ({exc}), falling back to per-file SFTP…")
-            self._upload_directory_sftp(local_path, remote_path, log_cb)
+                log_cb(f"Staged tar.gz failed ({exc}), falling back to per-file SFTP…")
         finally:
-            # Clean up temp archive
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+        # ---- Fallback 2: per-file SFTP ----------------------------------------
+        self._upload_directory_sftp(local_path, remote_path, log_cb)
+
+    def _upload_directory_streaming_tar(
+        self,
+        local: Path,
+        remote_path: str,
+        all_files: list,
+        total_bytes: int,
+        log_cb: LogCallback,
+    ) -> None:
+        """Pipe an uncompressed tar stream into ``tar -xf -`` on the remote.
+
+        This bypasses SFTP entirely for the data path. The SSH exec channel
+        carries the tar bytes; the remote ``tar`` command writes the files
+        as the stream arrives. Memory use is O(1).
+        """
+        self._ensure_connected()
+        transport = self._client.get_transport()
+        channel = transport.open_session()
+        # Larger timeout — big uploads can take a while
+        channel.settimeout(None)
+
+        quoted_remote = shlex.quote(remote_path)
+        # -m: don't restore mtimes (faster, avoids clock-skew warnings)
+        remote_cmd = f"tar -xmf - -C {quoted_remote}"
+        channel.exec_command(remote_cmd)
+
+        bytes_sent = [0]
+        last_pct = [-1]
+        last_log_time = [time.monotonic()]
+        start_time = time.monotonic()
+
+        class _ProgressStream:
+            """File-like wrapper that forwards writes to the SSH channel and
+            reports progress to ``log_cb``. tarfile only needs write/flush."""
+
+            def __init__(self, ch):
+                self._ch = ch
+
+            def write(self, data):
+                # paramiko channel.sendall blocks until all bytes are queued
+                self._ch.sendall(data)
+                bytes_sent[0] += len(data)
+                if log_cb and total_bytes:
+                    pct = int(bytes_sent[0] / total_bytes * 100)
+                    now = time.monotonic()
+                    # Throttle: log on 10% step OR every 5s, whichever first
+                    if pct // 10 > last_pct[0] // 10 or (now - last_log_time[0]) >= 5.0:
+                        last_pct[0] = pct
+                        last_log_time[0] = now
+                        elapsed = now - start_time
+                        mb_done = bytes_sent[0] / (1024 * 1024)
+                        speed = (mb_done / elapsed) if elapsed > 0 else 0.0
+                        log_cb(
+                            f"  ↑ {mb_done:.1f} / {total_bytes / (1024 * 1024):.1f} MB "
+                            f"({pct}%, {speed:.1f} MB/s)"
+                        )
+                return len(data)
+
+            def flush(self):
+                pass
+
+        stream = _ProgressStream(channel)
+        try:
+            # mode "w|" = streaming tar, uncompressed, no seek required
+            with tarfile.open(fileobj=stream, mode="w|") as tar:
+                for f in all_files:
+                    arcname = f.relative_to(local).as_posix()
+                    # recursive=False — we already enumerated every file
+                    tar.add(str(f), arcname=arcname, recursive=False)
+        finally:
+            # Signal EOF to remote tar so it can finish and exit
             try:
-                os.unlink(tmp_path)
+                channel.shutdown_write()
             except Exception:
                 pass
+
+        # Wait for remote tar to finish
+        exit_code = channel.recv_exit_status()
+        # Drain stderr for diagnostics on failure
+        err = b""
+        try:
+            while channel.recv_stderr_ready():
+                err += channel.recv_stderr(4096)
+        except Exception:
+            pass
+        try:
+            channel.close()
+        except Exception:
+            pass
+
+        if exit_code != 0:
+            err_text = err.decode("utf-8", errors="replace").strip()
+            raise SSHError(
+                f"Remote tar extract failed (exit {exit_code}): {err_text or 'no stderr'}"
+            )
+
+        if log_cb:
+            elapsed = time.monotonic() - start_time
+            mb = total_bytes / (1024 * 1024)
+            speed = mb / elapsed if elapsed > 0 else 0.0
+            log_cb(f"Streamed {mb:.1f} MB in {elapsed:.1f}s ({speed:.1f} MB/s)")
 
     @staticmethod
     def _make_progress_cb(log_cb: LogCallback, total_mb: float):
@@ -318,8 +473,12 @@ class SSHManager:
     ) -> None:
         """Recursively download a remote directory to a local path.
 
-        Uses tar+gzip: archives remotely, downloads one file, extracts locally.
-        Falls back to per-file SFTP on failure.
+        Strategy:
+          1. **Streaming tar from exec stdout** — runs ``tar -cf - .`` on
+             remote and pipes stdout straight into a local extractor. No
+             intermediate file, no remote disk pressure.
+          2. **Staged tar.gz via SFTP** — old path, kept as fallback.
+          3. **Per-file SFTP** — last resort.
         """
         self._ensure_connected()
         local = Path(local_path)
@@ -328,8 +487,18 @@ class SSHManager:
         if log_cb:
             log_cb(f"Downloading {remote_path} → {local_path}")
 
+        # ---- Primary: streaming tar from exec ---------------------------------
         try:
-            # Create archive on remote
+            self._download_directory_streaming_tar(remote_path, local, log_cb)
+            if log_cb:
+                log_cb("Download complete.")
+            return
+        except Exception as exc:
+            if log_cb:
+                log_cb(f"Streaming download failed ({exc}), falling back to staged tar.gz…")
+
+        # ---- Fallback 1: staged tar.gz ----------------------------------------
+        try:
             remote_archive = f"{remote_path}/_download.tar.gz"
             if log_cb:
                 log_cb("Packing results on remote server…")
@@ -340,32 +509,116 @@ class SSHManager:
             if rc != 0:
                 raise SSHError("Remote tar packing failed")
 
-            # Download single archive
             tmp_path = os.path.join(tempfile.gettempdir(), "_download.tar.gz")
             if log_cb:
                 log_cb("Downloading archive…")
             self._sftp.get(remote_archive, tmp_path)
-
-            # Clean up remote archive
             self.exec_command(f"rm -f {remote_archive}")
 
-            # Extract locally
             archive_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
             if log_cb:
                 log_cb(f"Extracting archive ({archive_size_mb:.1f} MB)…")
             with tarfile.open(tmp_path, "r:gz") as tar:
                 tar.extractall(path=str(local), filter="data")
-
             os.unlink(tmp_path)
             if log_cb:
                 log_cb("Download complete.")
-
+            return
         except Exception as exc:
             if log_cb:
-                log_cb(f"Fast download failed ({exc}), falling back to per-file SFTP…")
-            self._download_recursive(remote_path, local, log_cb)
-            if log_cb:
-                log_cb("Download complete.")
+                log_cb(f"Staged download failed ({exc}), falling back to per-file SFTP…")
+
+        # ---- Fallback 2: per-file SFTP ----------------------------------------
+        self._download_recursive(remote_path, local, log_cb)
+        if log_cb:
+            log_cb("Download complete.")
+
+    def _download_directory_streaming_tar(
+        self,
+        remote_path: str,
+        local: Path,
+        log_cb: LogCallback,
+    ) -> None:
+        """Run ``tar -cf - .`` on remote and extract its stdout locally."""
+        self._ensure_connected()
+        transport = self._client.get_transport()
+        channel = transport.open_session()
+        channel.settimeout(None)
+
+        quoted_remote = shlex.quote(remote_path)
+        # Uncompressed stream — model artifacts are mostly already-binary;
+        # for text/CSV the savings don't justify CPU on both ends.
+        remote_cmd = f"cd {quoted_remote} && tar -cf - ."
+        channel.exec_command(remote_cmd)
+
+        bytes_recv = [0]
+        last_log_time = [time.monotonic()]
+        start_time = time.monotonic()
+
+        class _ReadStream:
+            """File-like wrapper around channel.recv for tarfile streaming."""
+
+            def __init__(self, ch):
+                self._ch = ch
+                self._buf = b""
+
+            def read(self, n=-1):
+                if n is None or n < 0:
+                    # Read everything (tarfile shouldn't request this in stream mode)
+                    chunks = [self._buf]
+                    self._buf = b""
+                    while True:
+                        data = self._ch.recv(65536)
+                        if not data:
+                            break
+                        chunks.append(data)
+                        bytes_recv[0] += len(data)
+                    return b"".join(chunks)
+                # Buffered read of exactly n bytes (or less at EOF)
+                while len(self._buf) < n:
+                    data = self._ch.recv(max(65536, n - len(self._buf)))
+                    if not data:
+                        break
+                    self._buf += data
+                    bytes_recv[0] += len(data)
+                    if log_cb:
+                        now = time.monotonic()
+                        if (now - last_log_time[0]) >= 5.0:
+                            last_log_time[0] = now
+                            elapsed = now - start_time
+                            mb = bytes_recv[0] / (1024 * 1024)
+                            speed = mb / elapsed if elapsed > 0 else 0.0
+                            log_cb(f"  ↓ {mb:.1f} MB ({speed:.1f} MB/s)")
+                out, self._buf = self._buf[:n], self._buf[n:]
+                return out
+
+        stream = _ReadStream(channel)
+        with tarfile.open(fileobj=stream, mode="r|") as tar:
+            tar.extractall(path=str(local), filter="data")
+
+        exit_code = channel.recv_exit_status()
+        err = b""
+        try:
+            while channel.recv_stderr_ready():
+                err += channel.recv_stderr(4096)
+        except Exception:
+            pass
+        try:
+            channel.close()
+        except Exception:
+            pass
+
+        if exit_code != 0:
+            err_text = err.decode("utf-8", errors="replace").strip()
+            raise SSHError(
+                f"Remote tar pack failed (exit {exit_code}): {err_text or 'no stderr'}"
+            )
+
+        if log_cb:
+            elapsed = time.monotonic() - start_time
+            mb = bytes_recv[0] / (1024 * 1024)
+            speed = mb / elapsed if elapsed > 0 else 0.0
+            log_cb(f"Streamed {mb:.1f} MB in {elapsed:.1f}s ({speed:.1f} MB/s)")
 
     def _download_recursive(
         self,
@@ -388,16 +641,177 @@ class SSHManager:
     def upload_file(self, local_file: str, remote_file: str) -> None:
         """Upload a single file."""
         self._ensure_connected()
+        local_path = Path(local_file)
+        if not local_path.is_file():
+            raise SSHError(f"Local file is not a file: {local_file}")
+
         remote_dir = str(PurePosixPath(remote_file).parent)
-        self._remote_mkdir_p(remote_dir)
-        self._sftp.put(local_file, remote_file)
+        rc = self.exec_command(f"mkdir -p {shlex.quote(remote_dir)}", log_cb=None, timeout=30)
+        if rc != 0:
+            raise SSHError(f"Failed to create remote directory: {remote_dir}")
+
+        try:
+            self._upload_file_streaming(local_path, remote_file)
+        except Exception as exc:
+            logger.debug("Streaming file upload failed, falling back to SFTP: %s", exc)
+            self._remote_mkdir_p(remote_dir)
+            self._sftp.put(str(local_path), remote_file)
+
+    def _upload_file_streaming(self, local_path: Path, remote_file: str) -> None:
+        """Upload a small/medium file over a fresh exec channel."""
+        transport = self._client.get_transport()
+        channel = transport.open_session()
+        channel.settimeout(None)
+        channel.exec_command(f"cat > {shlex.quote(remote_file)}")
+
+        try:
+            with open(local_path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    channel.sendall(chunk)
+        finally:
+            try:
+                channel.shutdown_write()
+            except Exception:
+                pass
+
+        exit_code = channel.recv_exit_status()
+        err = b""
+        try:
+            while channel.recv_stderr_ready():
+                err += channel.recv_stderr(4096)
+        except Exception:
+            pass
+        try:
+            channel.close()
+        except Exception:
+            pass
+
+        if exit_code != 0:
+            err_text = err.decode("utf-8", errors="replace").strip()
+            raise SSHError(
+                f"Remote file write failed (exit {exit_code}): {err_text or 'no stderr'}"
+            )
+
+    def remote_path_exists(self, remote_path: str, timeout: int = 15) -> bool:
+        """Return True if a remote path exists.
+
+        This intentionally uses a short-lived SSH exec channel instead of the
+        long-lived SFTP client. In attached mode the SFTP channel can occasionally
+        hang after large installs or transfers, while opening a fresh exec channel
+        for ``test -e`` stays responsive.
+        """
+        self._ensure_connected()
+        channel = None
+        try:
+            transport = self._client.get_transport()
+            channel = transport.open_session()
+            channel.settimeout(1)
+            channel.exec_command(f"test -e {shlex.quote(remote_path)}")
+            deadline = time.monotonic() + timeout
+            while not channel.exit_status_ready():
+                if time.monotonic() >= deadline:
+                    channel.close()
+                    return False
+                time.sleep(0.05)
+            return channel.recv_exit_status() == 0
+        except Exception as exc:
+            logger.debug("Remote path check failed for %s: %s", remote_path, exc)
+            return False
+        finally:
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Remote inspection helpers
+    # ------------------------------------------------------------------
+    def verify_remote_data(self, log_cb: LogCallback = None) -> dict:
+        """Check which workspace folders exist remotely.
+
+        Returns a dict like ``{"data": True, "output": True, "train.py": True}``.
+        """
+        self._ensure_connected()
+        result = {}
+        for name, path in [
+            ("data", "/workspace/data"),
+            ("output", "/workspace/output"),
+            ("train.py", "/workspace/train.py"),
+        ]:
+            exists = self.remote_path_exists(path)
+            result[name] = exists
+            if log_cb:
+                mark = "✓" if exists else "✗"
+                state = "exists" if exists else "not found"
+                log_cb(f"  {mark} {path} {state}")
+        return result
+
+    def get_remote_file_structure(
+        self,
+        remote_path: str = "/workspace",
+        max_depth: int = 3,
+        log_cb: LogCallback = None,
+    ) -> list:
+        """Return a list of dicts representing the remote file tree.
+
+        Each entry: ``{"path": "/workspace/data", "name": "data",
+                       "is_dir": True, "size": 0, "children": [...]}``.
+        """
+        self._ensure_connected()
+
+        def _walk(path: str, depth: int) -> list:
+            if depth > max_depth:
+                return []
+            entries = []
+            try:
+                items = self._sftp.listdir_attr(path)
+            except PermissionError:
+                return []
+            except Exception:
+                return []
+            for item in sorted(items, key=lambda a: a.filename):
+                full = f"{path}/{item.filename}"
+                is_dir = stat.S_ISDIR(item.st_mode)
+                node = {
+                    "path": full,
+                    "name": item.filename,
+                    "is_dir": is_dir,
+                    "size": item.st_size if not is_dir else 0,
+                    "children": [],
+                }
+                if is_dir:
+                    node["children"] = _walk(full, depth + 1)
+                entries.append(node)
+            return entries
+
+        if log_cb:
+            log_cb(f"Scanning remote: {remote_path} (depth={max_depth})…")
+        tree = _walk(remote_path, 1)
+        if log_cb:
+            log_cb(f"Found {sum(1 for _ in _flatten(tree))} items.")
+        return tree
+
+    def delete_remote_path(self, remote_path: str, log_cb: LogCallback = None) -> None:
+        """Recursively delete a remote file or directory."""
+        self._ensure_connected()
+        if log_cb:
+            log_cb(f"Deleting {remote_path}…")
+        rc = self.exec_command(f"rm -rf {remote_path}", log_cb=log_cb)
+        if rc != 0:
+            raise SSHError(f"Failed to delete {remote_path}")
 
     # ------------------------------------------------------------------
     # Rsync-based transfer (resume + checksum)
     # ------------------------------------------------------------------
     @staticmethod
     def _has_rsync() -> bool:
-        """Check if rsync is available locally."""
+        """Check if rsync is available locally (never on Windows — Git rsync mis-handles paths)."""
+        if platform.system() == "Windows":
+            return False
         return shutil.which("rsync") is not None
 
     def upload_rsync(

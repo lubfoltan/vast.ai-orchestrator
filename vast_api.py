@@ -36,6 +36,7 @@ class VastAPI:
         min_reliability: float = 0.95,
         min_dl_speed: float = 100.0,
         min_ul_speed: float = 50.0,
+        docker_image: str = "pytorch/pytorch:latest",
         log_cb: LogCallback = None,
     ) -> List[Dict[str, Any]]:
         """Search for available GPU offers, scored by best value.
@@ -43,6 +44,9 @@ class VastAPI:
         Filters by reliability and network speed, then ranks by a composite
         ''value score'' that balances price, GPU performance, and connectivity
         rather than sorting by lowest price alone.
+
+        Instances that already have *docker_image* cached get a large bonus
+        so training can start immediately without a lengthy image pull.
         """
         query = f"gpu_ram>={min_gpu_ram} dph_total<={max_price} rentable=true"
         if gpu_name:
@@ -75,12 +79,27 @@ class VastAPI:
                 continue
             filtered.append(offer)
 
+        # ── Tag offers that have our Docker image cached ──
+        for offer in filtered:
+            # Vast.ai exposes image_args or cuda_max_good; check multiple fields
+            cached_images = offer.get("image_args", []) or []
+            if isinstance(cached_images, str):
+                cached_images = [cached_images]
+            offer["_has_cached_image"] = (
+                docker_image in cached_images
+                or offer.get("cur_image", "") == docker_image
+            )
+
         if log_cb:
-            log_cb(f"Offers: {len(result)} total → {len(filtered)} after reliability/speed filter")
+            cached_count = sum(1 for o in filtered if o["_has_cached_image"])
+            log_cb(
+                f"Offers: {len(result)} total → {len(filtered)} after reliability/speed filter "
+                f"({cached_count} with image cached)"
+            )
 
         # ── Score remaining offers ──
         # Value = GPU_performance × Network_speed / Price
-        # Higher is better.
+        # Offers with the Docker image already cached get a 3× bonus.
         for offer in filtered:
             gpu_ram = offer.get("gpu_ram", 8) or 8
             dl = offer.get("inet_down", 100) or 100
@@ -88,6 +107,7 @@ class VastAPI:
             price = offer.get("dph_total", 1.0) or 1.0
             reliability = offer.get("reliability2", offer.get("reliability", 0.95)) or 0.95
             dlperf = offer.get("dlperf", 5) or 5  # deep learning perf score
+            cache_bonus = 3.0 if offer["_has_cached_image"] else 1.0
 
             # Composite score (higher = better value for a short sprint)
             offer["_value_score"] = (
@@ -95,6 +115,7 @@ class VastAPI:
                 * (gpu_ram / 8.0)        # VRAM bonus
                 * reliability            # uptime reliability
                 * min(dl + ul, 2000) / 500  # network throughput factor
+                * cache_bonus            # image already pulled = instant start
                 / max(price, 0.01)       # cost efficiency
             )
 
@@ -103,12 +124,14 @@ class VastAPI:
 
         if log_cb and filtered:
             top = filtered[0]
+            cache_tag = " ⚡ Cache Hit" if top["_has_cached_image"] else ""
             log_cb(
                 f"Top pick: {top.get('gpu_name', '?')} "
                 f"({top.get('gpu_ram', '?')} GB) — "
                 f"${top.get('dph_total', '?')}/hr — "
                 f"score {top['_value_score']:.1f} — "
                 f"reliability {top.get('reliability2', top.get('reliability', '?')):.0%}"
+                f"{cache_tag}"
             )
 
         return filtered

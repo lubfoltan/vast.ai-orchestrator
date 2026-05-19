@@ -43,3 +43,6 @@ results/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# User config (contains API keys / local paths)
+user_config.json

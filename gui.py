@@ -1,6 +1,7 @@
 """SCOUT — Desktop GUI for Vast.ai Training Orchestrator."""
 
 import csv
+import json
 import os
 import threading
 import time
@@ -12,6 +13,7 @@ import customtkinter as ctk
 
 from config import ExperimentConfig
 from orchestrator import Orchestrator
+from vast_api import VastAPI
 
 try:
     import matplotlib
@@ -25,6 +27,8 @@ except ImportError:
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+_USER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "user_config.json")
 
 
 class App(ctk.CTk):
@@ -44,6 +48,8 @@ class App(ctk.CTk):
         self._ssh_console_active = False
 
         self._build_ui()
+        self._load_user_config()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ==================================================================
     # UI construction
@@ -135,8 +141,10 @@ class App(ctk.CTk):
         # ── Paths ──
         ctk.CTkLabel(f, text="Train Data:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
         self.data_path_var = ctk.StringVar()
-        ctk.CTkEntry(f, textvariable=self.data_path_var).grid(row=row, column=1, columnspan=2, padx=5, pady=4, sticky="ew")
-        ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_data).grid(row=row, column=3, padx=2)
+        self._data_entry = ctk.CTkEntry(f, textvariable=self.data_path_var)
+        self._data_entry.grid(row=row, column=1, columnspan=2, padx=5, pady=4, sticky="ew")
+        self._data_browse_btn = ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_data)
+        self._data_browse_btn.grid(row=row, column=3, padx=2)
 
         ctk.CTkLabel(f, text="Output Path:").grid(row=row, column=4, padx=5, pady=4, sticky="e")
         self.output_path_var = ctk.StringVar()
@@ -146,15 +154,54 @@ class App(ctk.CTk):
         row += 1
         ctk.CTkLabel(f, text="Test Data:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
         self.test_data_path_var = ctk.StringVar()
-        ctk.CTkEntry(f, textvariable=self.test_data_path_var, placeholder_text="(Optional — leave empty to split from Train)").grid(
-            row=row, column=1, columnspan=2, padx=5, pady=4, sticky="ew"
+        self._test_data_entry = ctk.CTkEntry(
+            f,
+            textvariable=self.test_data_path_var,
+            placeholder_text="(Optional separate test set; ignored for pre-split data)",
         )
-        ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_test_data).grid(row=row, column=3, padx=2)
+        self._test_data_entry.grid(row=row, column=1, columnspan=2, padx=5, pady=4, sticky="ew")
+        self._test_data_browse_btn = ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_test_data)
+        self._test_data_browse_btn.grid(row=row, column=3, padx=2)
 
-        ctk.CTkLabel(f, text="Train/Test Split:").grid(row=row, column=4, padx=5, pady=4, sticky="e")
+        ctk.CTkLabel(f, text="Seed:").grid(row=row, column=4, padx=5, pady=4, sticky="e")
+        self.seed_var = ctk.StringVar(value="42")
+        ctk.CTkEntry(f, textvariable=self.seed_var, width=70).grid(row=row, column=5, padx=5, pady=4, sticky="w")
+
+        row += 1
+        self.pre_split_data_var = ctk.BooleanVar(value=False)
+        self.pre_split_data_cb = ctk.CTkCheckBox(
+            f,
+            text="Data already split into train/val/test",
+            variable=self.pre_split_data_var,
+            command=self._on_pre_split_toggled,
+        )
+        self.pre_split_data_cb.grid(row=row, column=1, columnspan=3, padx=5, pady=4, sticky="w")
+
+        ctk.CTkLabel(f, text="Split Ratio:").grid(row=row, column=4, padx=5, pady=4, sticky="e")
+        self.ratio_frame = ctk.CTkFrame(f, fg_color="transparent")
+        self.ratio_frame.grid(row=row, column=5, columnspan=2, padx=5, pady=4, sticky="w")
         self.split_var = ctk.StringVar(value="0.8")
-        ctk.CTkEntry(f, textvariable=self.split_var, width=60).grid(row=row, column=5, padx=5, pady=4, sticky="w")
-        ctk.CTkLabel(f, text="(train ratio)").grid(row=row, column=6, padx=2, sticky="w")
+        self.val_split_var = ctk.StringVar(value="0.1")
+        self.test_split_var = ctk.StringVar(value="0.1")
+        ctk.CTkLabel(self.ratio_frame, text="train").pack(side="left", padx=(0, 2))
+        self._train_split_entry = ctk.CTkEntry(self.ratio_frame, textvariable=self.split_var, width=52)
+        self._train_split_entry.pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(self.ratio_frame, text="val").pack(side="left", padx=(0, 2))
+        self._val_split_entry = ctk.CTkEntry(self.ratio_frame, textvariable=self.val_split_var, width=52)
+        self._val_split_entry.pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(self.ratio_frame, text="test").pack(side="left", padx=(0, 2))
+        self._test_split_entry = ctk.CTkEntry(self.ratio_frame, textvariable=self.test_split_var, width=52)
+        self._test_split_entry.pack(side="left")
+
+        row += 1
+        # ── Test Mode (CIFAR-100) ──
+        self.use_builtin_var = ctk.BooleanVar(value=False)
+        self.use_builtin_cb = ctk.CTkCheckBox(
+            f, text="Use Built-in Test Dataset (CIFAR-100)",
+            variable=self.use_builtin_var,
+            command=self._on_use_builtin_toggled,
+        )
+        self.use_builtin_cb.grid(row=row, column=1, columnspan=3, padx=5, pady=4, sticky="w")
 
         row += 1
         # ── API Key ──
@@ -229,6 +276,15 @@ class App(ctk.CTk):
         ctk.CTkEntry(f, textvariable=self.max_price_var, width=60).grid(row=row, column=5, padx=5, pady=4, sticky="w")
 
         row += 1
+        # ── Dataset subsampling ──
+        ctk.CTkLabel(f, text="Max Samples/Class:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
+        self.max_samples_var = ctk.StringVar(value="0")
+        ctk.CTkEntry(f, textvariable=self.max_samples_var, width=80).grid(row=row, column=1, padx=5, pady=4, sticky="w")
+        ctk.CTkLabel(f, text="(0 = use full dataset; e.g. 250 → 250 NORMAL + 250 PNEUMONIA)").grid(
+            row=row, column=2, columnspan=5, padx=5, pady=4, sticky="w"
+        )
+
+        row += 1
         # ── Augmentation (classification only) ──
         self.aug_label = ctk.CTkLabel(f, text="Augmentation:")
         self.aug_label.grid(row=row, column=0, padx=5, pady=4, sticky="ne")
@@ -298,6 +354,32 @@ class App(ctk.CTk):
             ctk.CTkCheckBox(self.met_frame, text=label, variable=var).pack(side="left", padx=5)
 
     # ------------------------------------------------------------------
+    def _on_use_builtin_toggled(self) -> None:
+        """Enable/disable data path inputs when test mode is toggled."""
+        builtin = self.use_builtin_var.get()
+        state = "disabled" if builtin else "normal"
+        self._data_entry.configure(state=state)
+        self._data_browse_btn.configure(state=state)
+        self.pre_split_data_cb.configure(state=state)
+        self._on_pre_split_toggled()
+
+    # ------------------------------------------------------------------
+    def _on_pre_split_toggled(self) -> None:
+        """Toggle fields that only apply when SCOUT creates the split."""
+        builtin = self.use_builtin_var.get()
+        pre_split = self.pre_split_data_var.get()
+        test_state = "disabled" if builtin or pre_split else "normal"
+        ratio_state = "disabled" if pre_split else "normal"
+
+        self._test_data_entry.configure(state=test_state)
+        self._test_data_browse_btn.configure(state=test_state)
+        for child in self.ratio_frame.winfo_children():
+            try:
+                child.configure(state=ratio_state)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
     def _on_task_type_changed(self, choice: str) -> None:
         """Show/hide fields based on classification vs regression."""
         self._rebuild_metrics(choice)
@@ -326,32 +408,46 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------------
     def _build_buttons(self, parent: ctk.CTkFrame) -> None:
-        parent.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+        parent.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6), weight=1)
 
         self.btn_start = ctk.CTkButton(parent, text="▶  Start Pipeline", command=self._on_start, fg_color="green")
-        self.btn_start.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
+        self.btn_start.grid(row=0, column=0, padx=6, pady=8, sticky="ew")
+
+        self.btn_attach = ctk.CTkButton(
+            parent, text="🔗  Connect Existing", command=self._on_attach, fg_color="#6366f1"
+        )
+        self.btn_attach.grid(row=0, column=1, padx=6, pady=8, sticky="ew")
 
         self.btn_cancel = ctk.CTkButton(parent, text="⏹  Stop Instance", command=self._on_cancel, state="disabled")
-        self.btn_cancel.grid(row=0, column=1, padx=8, pady=8, sticky="ew")
+        self.btn_cancel.grid(row=0, column=2, padx=6, pady=8, sticky="ew")
 
         self.btn_destroy = ctk.CTkButton(
-            parent, text="🗑  Terminate Instance", command=self._on_destroy, fg_color="red", state="disabled"
+            parent, text="🗑  Terminate", command=self._on_destroy, fg_color="red", state="disabled"
         )
-        self.btn_destroy.grid(row=0, column=2, padx=8, pady=8, sticky="ew")
+        self.btn_destroy.grid(row=0, column=3, padx=6, pady=8, sticky="ew")
 
         self.btn_ssh_console = ctk.CTkButton(
             parent, text="💻  SSH Console", command=self._on_ssh_console, state="disabled"
         )
-        self.btn_ssh_console.grid(row=0, column=3, padx=8, pady=8, sticky="ew")
+        self.btn_ssh_console.grid(row=0, column=4, padx=6, pady=8, sticky="ew")
+
+        self.btn_files = ctk.CTkButton(
+            parent, text="📂  Remote Files", command=self._on_toggle_file_browser, state="disabled"
+        )
+        self.btn_files.grid(row=0, column=5, padx=6, pady=8, sticky="ew")
 
         self.btn_chart = ctk.CTkButton(
             parent, text="📈  Live Chart", command=self._on_toggle_chart,
             state="normal" if _HAS_MATPLOTLIB else "disabled"
         )
-        self.btn_chart.grid(row=0, column=4, padx=8, pady=8, sticky="ew")
+        self.btn_chart.grid(row=0, column=6, padx=6, pady=8, sticky="ew")
 
-        self.btn_clear = ctk.CTkButton(parent, text="Clear Log", command=self._clear_log)
-        self.btn_clear.grid(row=0, column=5, padx=8, pady=8, sticky="ew")
+        self.btn_clear = ctk.CTkButton(parent, text="Clear Log", command=self._clear_log, fg_color="gray")
+        self.btn_clear.grid(row=1, column=0, padx=6, pady=(0, 6), sticky="ew")
+
+        # Status label for attach mode
+        self._status_label = ctk.CTkLabel(parent, text="", font=("Consolas", 11))
+        self._status_label.grid(row=1, column=1, columnspan=6, padx=6, pady=(0, 6), sticky="w")
 
     # ==================================================================
     # Helpers
@@ -402,9 +498,83 @@ class App(ctk.CTk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
+    # ------------------------------------------------------------------
+    # Persistent user config
+    # ------------------------------------------------------------------
+    def _load_user_config(self) -> None:
+        """Load saved settings from user_config.json and populate GUI fields."""
+        if not os.path.isfile(_USER_CONFIG_PATH):
+            return
+        try:
+            with open(_USER_CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+
+        self.api_key_var.set(cfg.get("api_key", ""))
+        self.ssh_key_var.set(cfg.get("ssh_key_path", ""))
+        self.data_path_var.set(cfg.get("data_path", ""))
+        self.test_data_path_var.set(cfg.get("test_data_path", ""))
+        self.output_path_var.set(cfg.get("output_path", ""))
+        self.custom_script_var.set(cfg.get("custom_script_path", ""))
+        self.task_type_var.set(cfg.get("task_type", "Classification"))
+        self.use_builtin_var.set(bool(cfg.get("use_builtin", False)))
+        self.pre_split_data_var.set(bool(cfg.get("pre_split_data", False)))
+        self.model_var.set(cfg.get("model", "ResNet-50"))
+        self.optimizer_var.set(cfg.get("optimizer", "AdamW"))
+        self.lr_var.set(cfg.get("learning_rate", "0.001"))
+        self.batch_var.set(int(cfg.get("batch_size", 32)))
+        self.epochs_var.set(int(cfg.get("epochs", 50)))
+        self.split_var.set(cfg.get("train_split", "0.8"))
+        self.val_split_var.set(cfg.get("val_split", "0.1"))
+        self.test_split_var.set(cfg.get("test_split", "0.1"))
+        self.seed_var.set(str(cfg.get("seed", 42)))
+        self.min_gpu_ram_var.set(cfg.get("min_gpu_ram", "8"))
+        self.max_price_var.set(cfg.get("max_price", "1.0"))
+        self.max_samples_var.set(str(cfg.get("max_samples_per_class", 0)))
+        self._on_use_builtin_toggled()
+
+    def _save_user_config(self) -> None:
+        """Persist current GUI settings to user_config.json."""
+        cfg = {
+            "api_key": self.api_key_var.get(),
+            "ssh_key_path": self.ssh_key_var.get(),
+            "data_path": self.data_path_var.get(),
+            "test_data_path": self.test_data_path_var.get(),
+            "output_path": self.output_path_var.get(),
+            "custom_script_path": self.custom_script_var.get(),
+            "task_type": self.task_type_var.get(),
+            "use_builtin": self.use_builtin_var.get(),
+            "pre_split_data": self.pre_split_data_var.get(),
+            "model": self.model_var.get(),
+            "optimizer": self.optimizer_var.get(),
+            "learning_rate": self.lr_var.get(),
+            "batch_size": self.batch_var.get(),
+            "epochs": self.epochs_var.get(),
+            "train_split": self.split_var.get(),
+            "val_split": self.val_split_var.get(),
+            "test_split": self.test_split_var.get(),
+            "seed": self.seed_var.get(),
+            "min_gpu_ram": self.min_gpu_ram_var.get(),
+            "max_price": self.max_price_var.get(),
+            "max_samples_per_class": int(self.max_samples_var.get() or 0),
+        }
+        try:
+            with open(_USER_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=4)
+        except OSError:
+            pass
+
+    def _on_close(self) -> None:
+        """Save settings and exit."""
+        self._save_user_config()
+        self.destroy()
+
     def _build_config(self) -> ExperimentConfig:
         cfg = ExperimentConfig()
         cfg.task_type = self.task_type_var.get().lower()
+        cfg.use_builtin = self.use_builtin_var.get()
+        cfg.pre_split_data = self.pre_split_data_var.get()
         cfg.data_path = self.data_path_var.get().strip()
         cfg.test_data_path = self.test_data_path_var.get().strip()
         cfg.output_path = self.output_path_var.get().strip()
@@ -423,6 +593,18 @@ class App(ctk.CTk):
             cfg.train_split = float(self.split_var.get())
         except ValueError:
             cfg.train_split = 0.8
+        try:
+            cfg.val_split = float(self.val_split_var.get())
+        except ValueError:
+            cfg.val_split = 0.1
+        try:
+            cfg.test_split = float(self.test_split_var.get())
+        except ValueError:
+            cfg.test_split = 0.1
+        try:
+            cfg.seed = int(self.seed_var.get())
+        except ValueError:
+            cfg.seed = 42
         # Regression fields
         cfg.target_column = self.target_col_var.get().strip()
         cfg.feature_columns = self.feature_cols_var.get().strip()
@@ -446,18 +628,53 @@ class App(ctk.CTk):
             cfg.max_price = float(self.max_price_var.get())
         except ValueError:
             cfg.max_price = 1.0
+        try:
+            cfg.max_samples_per_class = int(self.max_samples_var.get() or 0)
+        except ValueError:
+            cfg.max_samples_per_class = 0
         return cfg
 
     # ==================================================================
     # Button callbacks
     # ==================================================================
-    def _validate_inputs(self) -> Optional[str]:
-        if not self.data_path_var.get().strip():
-            return "Train Data path is required."
+    def _validate_inputs(self, attach_mode: bool = False) -> Optional[str]:
+        use_builtin = self.use_builtin_var.get()
+        pre_split = self.pre_split_data_var.get()
+        data_path = self.data_path_var.get().strip()
+        if not attach_mode:
+            if not use_builtin and not data_path:
+                return "Dataset path is required (or enable built-in CIFAR-100)."
+            if not use_builtin and not os.path.isdir(data_path):
+                return f"Dataset folder not found: {data_path}"
+            if not use_builtin and pre_split:
+                train_dir = os.path.join(data_path, "train")
+                val_dir = os.path.join(data_path, "val")
+                validation_dir = os.path.join(data_path, "validation")
+                test_dir = os.path.join(data_path, "test")
+                if not os.path.isdir(train_dir) or not (os.path.isdir(val_dir) or os.path.isdir(validation_dir)) or not os.path.isdir(test_dir):
+                    return "Pre-split dataset must contain train, val (or validation), and test folders."
+            if not self.api_key_var.get().strip():
+                return "Vast.ai API Key is required."
+        if not pre_split:
+            try:
+                train_ratio = float(self.split_var.get())
+                val_ratio = float(self.val_split_var.get())
+                test_ratio = float(self.test_split_var.get())
+            except ValueError:
+                return "Train/val/test ratios must be numbers."
+            if train_ratio <= 0 or val_ratio <= 0 or test_ratio <= 0:
+                return "Train/val/test ratios must be greater than 0."
+            if abs((train_ratio + val_ratio + test_ratio) - 1.0) > 1e-4:
+                return "Train + val + test ratios must equal 1.0."
+        try:
+            int(self.seed_var.get())
+        except ValueError:
+            return "Seed must be an integer."
+        test_path = self.test_data_path_var.get().strip()
+        if test_path and not pre_split and not os.path.isdir(test_path):
+            return f"Test Data folder not found: {test_path}"
         if not self.output_path_var.get().strip():
             return "Output Path is required."
-        if not self.api_key_var.get().strip():
-            return "Vast.ai API Key is required."
         ssh_key = self.ssh_key_var.get().strip()
         if not ssh_key:
             return "SSH Key path is required."
@@ -476,6 +693,11 @@ class App(ctk.CTk):
         return None
 
     def _on_start(self) -> None:
+        # If already attached to an existing instance, run in attached mode
+        if self._orchestrator and self._orchestrator._attached and self._orchestrator.ssh and self._orchestrator.ssh.is_connected:
+            self._on_start_attached()
+            return
+
         err = self._validate_inputs()
         if err:
             self._append_log(f"⚠  Validation error: {err}")
@@ -502,13 +724,22 @@ class App(ctk.CTk):
             self.after(0, self._pipeline_finished)
 
     def _pipeline_finished(self) -> None:
-        self.btn_start.configure(state="normal")
+        if self._orchestrator and self._orchestrator._attached:
+            self.btn_start.configure(text="▶  Start Training", state="normal")
+        else:
+            self.btn_start.configure(text="▶  Start Pipeline", state="normal")
+        self.btn_attach.configure(state="normal")
         self.btn_cancel.configure(state="disabled")
         if self._orchestrator and self._orchestrator.instance_id:
             self.btn_destroy.configure(state="normal")
             # Enable SSH console if we have a live SSH connection
             if self._orchestrator.ssh and self._orchestrator.ssh.is_connected:
                 self.btn_ssh_console.configure(state="normal")
+                self.btn_files.configure(state="normal")
+        elif self._orchestrator and self._orchestrator._attached:
+            if self._orchestrator.ssh and self._orchestrator.ssh.is_connected:
+                self.btn_ssh_console.configure(state="normal")
+                self.btn_files.configure(state="normal")
 
     def _on_cancel(self) -> None:
         if self._orchestrator:
@@ -528,6 +759,245 @@ class App(ctk.CTk):
         self._orchestrator.destroy_instance()
         self.after(0, lambda: self.btn_destroy.configure(state="disabled"))
         self.after(0, lambda: self.btn_ssh_console.configure(state="disabled"))
+
+    # ==================================================================
+    # Attach to Existing Instance
+    # ==================================================================
+    def _on_attach(self) -> None:
+        """Open a popup to input SSH host/port and connect to existing instance."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Connect to Existing Instance")
+        popup.geometry("420x220")
+        popup.resizable(False, False)
+        popup.transient(self)
+        popup.grab_set()
+
+        ctk.CTkLabel(popup, text="SSH Host:", font=("Consolas", 12)).grid(
+            row=0, column=0, padx=10, pady=(15, 5), sticky="e"
+        )
+        host_var = ctk.StringVar(value="ssh5.vast.ai")
+        ctk.CTkEntry(popup, textvariable=host_var, width=240).grid(
+            row=0, column=1, padx=10, pady=(15, 5), sticky="ew"
+        )
+
+        ctk.CTkLabel(popup, text="SSH Port:", font=("Consolas", 12)).grid(
+            row=1, column=0, padx=10, pady=5, sticky="e"
+        )
+        port_var = ctk.StringVar(value="22")
+        ctk.CTkEntry(popup, textvariable=port_var, width=240).grid(
+            row=1, column=1, padx=10, pady=5, sticky="ew"
+        )
+
+        ctk.CTkLabel(popup, text="Instance ID:", font=("Consolas", 12)).grid(
+            row=2, column=0, padx=10, pady=5, sticky="e"
+        )
+        iid_var = ctk.StringVar()
+        ctk.CTkEntry(popup, textvariable=iid_var, width=240,
+                      placeholder_text="(optional — for stop/destroy)").grid(
+            row=2, column=1, padx=10, pady=5, sticky="ew"
+        )
+
+        status_lbl = ctk.CTkLabel(popup, text="", text_color="red")
+        status_lbl.grid(row=3, column=0, columnspan=2, padx=10, pady=5)
+
+        def do_connect():
+            host = host_var.get().strip()
+            port_str = port_var.get().strip()
+            if not host:
+                status_lbl.configure(text="Host is required.")
+                return
+            try:
+                port = int(port_str)
+            except ValueError:
+                status_lbl.configure(text="Port must be a number.")
+                return
+
+            ssh_key = self.ssh_key_var.get().strip()
+            if not ssh_key or not os.path.isfile(ssh_key):
+                status_lbl.configure(text="SSH Key path is missing or invalid.")
+                return
+
+            status_lbl.configure(text="Connecting…", text_color="yellow")
+            popup.update()
+
+            cfg = self._build_config()
+            self._orchestrator = Orchestrator(
+                cfg, log_cb=self._append_log,
+                telemetry_cb=self._on_telemetry_data,
+            )
+
+            # Try to parse instance ID
+            iid = iid_var.get().strip()
+            if iid:
+                try:
+                    self._orchestrator.instance_id = int(iid)
+                    if cfg.api_key:
+                        self._orchestrator.vast = VastAPI(cfg.api_key)
+                except ValueError:
+                    pass
+
+            # Connect in background
+            def _do():
+                try:
+                    self._orchestrator.attach(host, port)
+                    self.after(0, _on_success)
+                except Exception as exc:
+                    self.after(0, lambda: status_lbl.configure(
+                        text=f"Failed: {exc}", text_color="red"))
+
+            def _on_success():
+                popup.destroy()
+                self._status_label.configure(text=f"🟢 Attached: {host}:{port}")
+                self.btn_start.configure(text="▶  Start Training", state="normal")
+                self.btn_ssh_console.configure(state="normal")
+                self.btn_files.configure(state="normal")
+                self.btn_cancel.configure(state="normal")
+                if self._orchestrator.instance_id:
+                    self.btn_destroy.configure(state="normal")
+                self._append_log(f"Attached to instance at {host}:{port}")
+
+            threading.Thread(target=_do, daemon=True).start()
+
+        ctk.CTkButton(popup, text="Connect", fg_color="green", command=do_connect).grid(
+            row=4, column=0, columnspan=2, padx=10, pady=10, sticky="ew"
+        )
+
+    def _on_start_attached(self) -> None:
+        """Run the pipeline on the attached instance."""
+        err = self._validate_inputs(attach_mode=True)
+        if err:
+            self._append_log(f"⚠  Validation error: {err}")
+            return
+
+        cfg = self._build_config()
+        # Update the existing orchestrator's config
+        self._orchestrator.config = cfg
+
+        self.btn_start.configure(text="▶  Training…", state="disabled")
+        self.btn_attach.configure(state="disabled")
+
+        def _run():
+            try:
+                self._orchestrator.run_attached()
+            finally:
+                self.after(0, self._pipeline_finished)
+
+        self._worker_thread = threading.Thread(target=_run, daemon=True)
+        self._worker_thread.start()
+
+    # ==================================================================
+    # Remote File Browser
+    # ==================================================================
+    def _on_toggle_file_browser(self) -> None:
+        """Open a remote file browser window."""
+        if not self._orchestrator or not self._orchestrator.ssh or not self._orchestrator.ssh.is_connected:
+            self._append_log("⚠  No active SSH connection.")
+            return
+
+        fb = ctk.CTkToplevel(self)
+        fb.title("Remote File Browser — /workspace")
+        fb.geometry("600x500")
+        fb.transient(self)
+
+        # Toolbar
+        toolbar = ctk.CTkFrame(fb)
+        toolbar.pack(fill="x", padx=5, pady=5)
+        ctk.CTkButton(toolbar, text="Refresh", width=80,
+                       command=lambda: self._refresh_file_browser(fb, tree_frame)).pack(side="left", padx=3)
+        ctk.CTkButton(toolbar, text="Delete /output", width=120, fg_color="red",
+                       command=lambda: self._delete_remote_output(fb, tree_frame)).pack(side="left", padx=3)
+        ctk.CTkButton(toolbar, text="Check Data", width=100,
+                       command=self._check_remote_data).pack(side="left", padx=3)
+
+        # Tree area (scrollable)
+        tree_frame = ctk.CTkScrollableFrame(fb)
+        tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Initial load
+        self._refresh_file_browser(fb, tree_frame)
+
+    def _refresh_file_browser(self, window, tree_frame) -> None:
+        """Reload the remote file tree into the scrollable frame."""
+        # Clear existing
+        for w in tree_frame.winfo_children():
+            w.destroy()
+
+        ctk.CTkLabel(tree_frame, text="Loading…", font=("Consolas", 11)).pack(anchor="w")
+        window.update()
+
+        def _load():
+            try:
+                tree = self._orchestrator.ssh.get_remote_file_structure(
+                    "/workspace", max_depth=3
+                )
+                self.after(0, lambda: self._render_file_tree(tree_frame, tree, 0))
+            except Exception as exc:
+                self.after(0, lambda: self._render_file_error(tree_frame, str(exc)))
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _render_file_tree(self, parent, nodes: list, depth: int) -> None:
+        """Render the file tree as indented labels."""
+        for w in parent.winfo_children():
+            w.destroy()
+        self._render_nodes(parent, nodes, depth)
+
+    def _render_nodes(self, parent, nodes: list, depth: int) -> None:
+        for node in nodes:
+            indent = "    " * depth
+            icon = "📁" if node["is_dir"] else "📄"
+            size_str = ""
+            if not node["is_dir"] and node["size"] > 0:
+                if node["size"] > 1024 * 1024:
+                    size_str = f"  ({node['size'] / (1024*1024):.1f} MB)"
+                elif node["size"] > 1024:
+                    size_str = f"  ({node['size'] / 1024:.0f} KB)"
+                else:
+                    size_str = f"  ({node['size']} B)"
+            text = f"{indent}{icon} {node['name']}{size_str}"
+            ctk.CTkLabel(parent, text=text, font=("Consolas", 11), anchor="w").pack(
+                fill="x", padx=2, pady=0
+            )
+            if node.get("children"):
+                self._render_nodes(parent, node["children"], depth + 1)
+
+    def _render_file_error(self, parent, msg: str) -> None:
+        for w in parent.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(parent, text=f"Error: {msg}", text_color="red").pack(anchor="w")
+
+    def _delete_remote_output(self, window, tree_frame) -> None:
+        """Delete /workspace/output on the remote server and refresh."""
+        if not self._orchestrator or not self._orchestrator.ssh:
+            return
+
+        def _do():
+            try:
+                self._orchestrator.ssh.delete_remote_path("/workspace/output", log_cb=self._append_log)
+                self._orchestrator.ssh.exec_command("mkdir -p /workspace/output", log_cb=self._append_log)
+                self._append_log("Remote /workspace/output cleared.")
+                self.after(0, lambda: self._refresh_file_browser(window, tree_frame))
+            except Exception as exc:
+                self._append_log(f"⚠  Delete failed: {exc}")
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _check_remote_data(self) -> None:
+        """Check if /workspace/data exists and report."""
+        if not self._orchestrator or not self._orchestrator.ssh:
+            return
+
+        def _do():
+            try:
+                status = self._orchestrator.ssh.verify_remote_data(log_cb=self._append_log)
+                summary = ", ".join(
+                    f"{k}: {'✓' if v else '✗'}" for k, v in status.items()
+                )
+                self._append_log(f"Remote status: {summary}")
+            except Exception as exc:
+                self._append_log(f"⚠  Check failed: {exc}")
+
+        threading.Thread(target=_do, daemon=True).start()
 
     # ==================================================================
     # Live Telemetry Chart
@@ -557,11 +1027,17 @@ class App(ctk.CTk):
         epochs = [int(r.get("epoch", 0)) for r in rows]
         train_loss = [float(r.get("train_loss", 0)) for r in rows]
         val_loss = [float(r.get("val_loss", 0)) for r in rows]
+        test_loss = [float(r.get("test_loss", 0)) for r in rows] if "test_loss" in rows[0] else []
 
         self._ax_loss.clear()
         self._ax_loss.plot(epochs, train_loss, "c-", linewidth=1.2, label="Train")
         self._ax_loss.plot(epochs, val_loss, "r-", linewidth=1.2, label="Val")
+        if test_loss:
+            self._ax_loss.plot(epochs, test_loss, color="#fbbf24", linewidth=1.2, label="Test")
         self._ax_loss.set_title("Loss", color="white", fontsize=9)
+        loss_values = train_loss + val_loss + test_loss
+        if loss_values:
+            self._ax_loss.set_ylim(0, max(max(loss_values) * 1.08, 1e-6))
         self._ax_loss.legend(fontsize=7, facecolor="#1a1a2e", edgecolor="#333", labelcolor="white")
         self._ax_loss.tick_params(colors="white", labelsize=7)
 
@@ -570,12 +1046,16 @@ class App(ctk.CTk):
         if "val_acc" in rows[0]:
             train_acc = [float(r.get("train_acc", 0)) for r in rows]
             val_acc = [float(r.get("val_acc", 0)) for r in rows]
+            test_acc = [float(r.get("test_acc", 0)) for r in rows] if "test_acc" in rows[0] else []
             self._ax_acc.plot(epochs, train_acc, "c-", linewidth=1.2, label="Train Acc")
             self._ax_acc.plot(epochs, val_acc, "r-", linewidth=1.2, label="Val Acc")
+            if test_acc:
+                self._ax_acc.plot(epochs, test_acc, color="#fbbf24", linewidth=1.2, label="Test Acc")
+            self._ax_acc.set_ylim(0, 1)
             self._ax_acc.set_title("Accuracy", color="white", fontsize=9)
         else:
             # Plot whatever metric columns exist (skip epoch, timestamp, losses)
-            skip = {"epoch", "timestamp", "train_loss", "val_loss"}
+            skip = {"epoch", "timestamp", "train_loss", "val_loss", "test_loss"}
             plotted = 0
             colors = ["#22d3ee", "#f472b6", "#a78bfa", "#34d399", "#fbbf24"]
             for key in rows[0]:

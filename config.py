@@ -27,7 +27,11 @@ class ExperimentConfig:
     batch_size: int = 32
     epochs: int = 50
     optimizer: str = "adamw"
-    train_split: float = 0.8  # Train ratio (rest = test/val)
+    train_split: float = 0.8
+    val_split: float = 0.1
+    test_split: float = 0.1
+    seed: int = 42
+    pre_split_data: bool = False  # data_path contains train/val/test folders
 
     # Regression-specific
     target_column: str = ""  # Name of the column to predict
@@ -37,6 +41,9 @@ class ExperimentConfig:
     random_rotation: bool = False
     horizontal_flip: bool = False
     random_erasing: bool = False
+
+    # Test mode
+    use_builtin: bool = False  # Use CIFAR-100 instead of user dataset
 
     # Feature flags
     early_stopping: bool = True
@@ -51,6 +58,9 @@ class ExperimentConfig:
         "accuracy", "loss", "precision", "recall", "f1_score",
         "auc_roc", "confusion_matrix",
     ])
+
+    # Dataset subsampling (0 = no limit)
+    max_samples_per_class: int = 500
 
     # Vast.ai instance filters
     min_gpu_ram: float = 8.0
@@ -91,10 +101,20 @@ class ExperimentConfig:
             f"--data_dir /workspace/data",
             f"--output_dir /workspace/output",
             f"--train_split {self.train_split}",
+            f"--val_split {self.val_split}",
+            f"--test_split {self.test_split}",
+            f"--seed {self.seed}",
         ]
 
+        if self.pre_split_data and not self.use_builtin:
+            parts.append("--pre_split_data")
+
+        # Built-in test dataset
+        if self.use_builtin:
+            parts.append("--use_builtin")
+
         # Test data
-        if self.test_data_path:
+        if self.test_data_path and not self.use_builtin and not self.pre_split_data:
             parts.append("--test_dir /workspace/test_data")
 
         # Regression columns

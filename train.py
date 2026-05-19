@@ -11,10 +11,10 @@ All results (metrics, plots, live telemetry CSV) are saved in output_dir.
 """
 
 import argparse
-import copy
 import csv
 import json
 import os
+import random
 import sys
 import time
 
@@ -22,10 +22,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import ImageFile
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, Subset, TensorDataset, random_split
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -44,6 +47,11 @@ def parse_args():
     p.add_argument("--test_dir", type=str, default="")
     p.add_argument("--output_dir", type=str, default="/workspace/output")
     p.add_argument("--train_split", type=float, default=0.8)
+    p.add_argument("--val_split", type=float, default=0.1)
+    p.add_argument("--test_split", type=float, default=0.1)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--pre_split_data", action="store_true",
+                   help="data_dir already contains train/val/test folders")
     # Regression specific
     p.add_argument("--target_column", type=str, default="")
     p.add_argument("--feature_columns", type=str, default="")
@@ -58,6 +66,8 @@ def parse_args():
     p.add_argument("--lr_scheduler", action="store_true")
     p.add_argument("--mixup", action="store_true")
     p.add_argument("--label_smoothing", action="store_true")
+    # Test mode
+    p.add_argument("--use_builtin", action="store_true", help="Use built-in CIFAR-100 dataset")
     # Metrics
     p.add_argument("--metrics", type=str, default="accuracy,loss,precision,recall,f1_score,auc_roc,confusion_matrix")
     return p.parse_args()
@@ -67,37 +77,136 @@ def parse_args():
 #  CLASSIFICATION
 # ══════════════════════════════════════════════════════════════════════
 def train_classification(args):
-    from torchvision import datasets, models, transforms
-    from sklearn import metrics as sk_metrics
+    from torchvision import datasets, transforms
 
     os.makedirs(args.output_dir, exist_ok=True)
+    _set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Classification] Device: {device}")
+    print(f"Seed: {args.seed}")
 
     requested_metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
     print(f"Metrics: {requested_metrics}")
 
     train_tfm, val_tfm = _build_cls_transforms(args)
 
-    full_dataset = datasets.ImageFolder(args.data_dir, transform=train_tfm)
-    num_classes = len(full_dataset.classes)
-    class_names = full_dataset.classes
-    print(f"Classes: {class_names}  ({num_classes} classes)")
-
-    if args.test_dir and os.path.isdir(args.test_dir):
-        train_ds = full_dataset
-        val_ds = datasets.ImageFolder(args.test_dir, transform=val_tfm)
-        print(f"Separate test dir: {args.test_dir} ({len(val_ds)} images)")
+    if getattr(args, "use_builtin", False):
+        print("[Test Mode] Using built-in CIFAR-100 dataset")
+        cifar_train_tfm = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761]),
+        ])
+        cifar_val_tfm = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761]),
+        ])
+        train_source_ds = datasets.CIFAR100(root=args.data_dir, train=True, download=True, transform=cifar_train_tfm)
+        eval_source_ds = datasets.CIFAR100(root=args.data_dir, train=True, download=True, transform=cifar_val_tfm)
+        test_ds = datasets.CIFAR100(root=args.data_dir, train=False, download=True, transform=cifar_val_tfm)
+        train_indices, val_indices, _ = _stratified_split_indices(
+            train_source_ds.targets,
+            args.train_split,
+            args.val_split,
+            0.0,
+            args.seed,
+            include_test=False,
+        )
+        train_ds = Subset(train_source_ds, train_indices)
+        val_ds = Subset(eval_source_ds, val_indices)
+        num_classes = 100
+        class_names = train_source_ds.classes
+        split_mode = "built-in CIFAR-100"
+        print(f"CIFAR-100: {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test ({num_classes} classes)")
     else:
-        val_size = int((1 - args.train_split) * len(full_dataset))
-        train_size = len(full_dataset) - val_size
-        train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
-        val_ds.dataset = copy.copy(full_dataset)
-        val_ds.dataset.transform = val_tfm
-        print(f"Split: {train_size} train / {val_size} test")
+        if args.pre_split_data:
+            train_dir = _resolve_split_dir(args.data_dir, ("train",))
+            val_dir = _resolve_split_dir(args.data_dir, ("val", "validation"))
+            test_dir = _resolve_split_dir(args.data_dir, ("test",))
+            train_ds = datasets.ImageFolder(train_dir, transform=train_tfm)
+            val_ds = datasets.ImageFolder(val_dir, transform=val_tfm)
+            test_ds = datasets.ImageFolder(test_dir, transform=val_tfm)
+            class_names = train_ds.classes
+            _ensure_class_names_match(class_names, val_ds.classes, "validation")
+            _ensure_class_names_match(class_names, test_ds.classes, "test")
+            num_classes = len(class_names)
+            split_mode = "pre-split folders"
+            print(f"Pre-split dataset: {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
+        elif args.test_dir and os.path.isdir(args.test_dir):
+            train_source_ds = datasets.ImageFolder(args.data_dir, transform=train_tfm)
+            eval_source_ds = datasets.ImageFolder(args.data_dir, transform=val_tfm)
+            test_ds = datasets.ImageFolder(args.test_dir, transform=val_tfm)
+            class_names = train_source_ds.classes
+            _ensure_class_names_match(class_names, test_ds.classes, "test")
+            num_classes = len(class_names)
+            train_indices, val_indices, _ = _stratified_split_indices(
+                train_source_ds.targets,
+                args.train_split,
+                args.val_split,
+                0.0,
+                args.seed,
+                include_test=False,
+            )
+            train_ds = Subset(train_source_ds, train_indices)
+            val_ds = Subset(eval_source_ds, val_indices)
+            split_mode = "train/val split with separate test folder"
+            print(f"Separate test dir: {args.test_dir} ({len(test_ds)} images)")
+            print(f"Split source data: {len(train_ds)} train / {len(val_ds)} val")
+        else:
+            train_source_ds = datasets.ImageFolder(args.data_dir, transform=train_tfm)
+            eval_source_ds = datasets.ImageFolder(args.data_dir, transform=val_tfm)
+            class_names = train_source_ds.classes
+            num_classes = len(class_names)
+            train_indices, val_indices, test_indices = _stratified_split_indices(
+                train_source_ds.targets,
+                args.train_split,
+                args.val_split,
+                args.test_split,
+                args.seed,
+                include_test=True,
+            )
+            train_ds = Subset(train_source_ds, train_indices)
+            val_ds = Subset(eval_source_ds, val_indices)
+            test_ds = Subset(eval_source_ds, test_indices)
+            split_mode = "seeded random train/val/test split"
+            print(f"Split: {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        print(f"Classes: {class_names}  ({num_classes} classes)")
+
+    _ensure_non_empty_split(train_ds, "train")
+    _ensure_non_empty_split(val_ds, "validation")
+    _ensure_non_empty_split(test_ds, "test")
+
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed)
+    pin_memory = torch.cuda.is_available()
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+        generator=loader_generator,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+    )
 
     model = _build_cls_model(args.model, num_classes).to(device)
     smoothing = 0.1 if args.label_smoothing else 0.0
@@ -105,15 +214,28 @@ def train_classification(args):
     opt = _build_optimizer(args, model)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs) if args.lr_scheduler else None
 
-    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
-    metric_history = {m: [] for m in requested_metrics if m not in ("loss", "confusion_matrix")}
+    history = {
+        "train_loss": [], "val_loss": [], "test_loss": [],
+        "train_acc": [], "val_acc": [], "test_acc": [],
+    }
+    scalar_metrics = [metric_name for metric_name in requested_metrics if metric_name not in ("loss", "confusion_matrix")]
+    val_metric_history = {metric_name: [] for metric_name in scalar_metrics}
+    test_metric_history = {metric_name: [] for metric_name in scalar_metrics}
 
     best_val_loss = float("inf")
     patience_counter = 0
-    epoch_metrics = {}
+    val_metrics = {}
+    test_metrics = {}
+    val_labels, val_preds, val_probs = [], [], []
+    test_labels, test_preds, test_probs = [], [], []
 
     # ── Live telemetry CSV ──
-    telemetry_fields = ["train_loss", "val_loss", "train_acc", "val_acc"] + list(metric_history.keys())
+    telemetry_fields = [
+        "train_loss", "val_loss", "test_loss",
+        "train_acc", "val_acc", "test_acc",
+    ]
+    telemetry_fields += [f"val_{metric_name}" for metric_name in scalar_metrics]
+    telemetry_fields += [f"test_{metric_name}" for metric_name in scalar_metrics]
     telemetry = LiveTelemetry(args.output_dir, telemetry_fields)
 
     for epoch in range(1, args.epochs + 1):
@@ -141,43 +263,39 @@ def train_classification(args):
         if scheduler:
             scheduler.step()
 
-        # Validation
-        model.eval()
-        running_loss, correct, total = 0.0, 0, 0
-        all_labels, all_preds, all_probs = [], [], []
-        with torch.no_grad():
-            for imgs, labels in val_loader:
-                imgs, labels = imgs.to(device), labels.to(device)
-                out = model(imgs)
-                loss = criterion(out, labels)
-                running_loss += loss.item() * imgs.size(0)
-                correct += (out.argmax(1) == labels).sum().item()
-                total += imgs.size(0)
-                all_labels.extend(labels.cpu().tolist())
-                all_preds.extend(out.argmax(1).cpu().tolist())
-                all_probs.extend(torch.softmax(out, dim=1).cpu().tolist())
-
-        val_loss = running_loss / total
-        val_acc = correct / total
+        val_loss, val_acc, val_metrics, val_labels, val_preds, val_probs = _evaluate_cls(
+            model, val_loader, criterion, device, requested_metrics, num_classes
+        )
+        test_loss, test_acc, test_metrics, test_labels, test_preds, test_probs = _evaluate_cls(
+            model, test_loader, criterion, device, requested_metrics, num_classes
+        )
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["test_loss"].append(test_loss)
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
+        history["test_acc"].append(test_acc)
 
-        epoch_metrics = _compute_cls_metrics(all_labels, all_preds, all_probs, requested_metrics, num_classes)
-        for m in metric_history:
-            metric_history[m].append(epoch_metrics.get(m, 0.0))
+        for metric_name in scalar_metrics:
+            val_metric_history[metric_name].append(val_metrics.get(metric_name, 0.0))
+            test_metric_history[metric_name].append(test_metrics.get(metric_name, 0.0))
 
-        metric_str = "  ".join(f"{k}: {v:.4f}" for k, v in epoch_metrics.items())
+        val_metric_str = "  ".join(f"val_{key}: {value:.4f}" for key, value in val_metrics.items())
+        test_metric_str = "  ".join(f"test_{key}: {value:.4f}" for key, value in test_metrics.items())
         print(f"Epoch {epoch}/{args.epochs}  TrainLoss: {train_loss:.4f}  Acc: {train_acc:.4f}  |  "
-              f"ValLoss: {val_loss:.4f}  Acc: {val_acc:.4f}  |  {metric_str}")
+              f"ValLoss: {val_loss:.4f}  Acc: {val_acc:.4f}  |  "
+              f"TestLoss: {test_loss:.4f}  Acc: {test_acc:.4f}  |  "
+              f"{val_metric_str}  {test_metric_str}")
         sys.stdout.flush()
 
         # ── Write live telemetry ──
-        telem_row = {"train_loss": train_loss, "val_loss": val_loss,
-                     "train_acc": train_acc, "val_acc": val_acc}
-        telem_row.update(epoch_metrics)
+        telem_row = {
+            "train_loss": train_loss, "val_loss": val_loss, "test_loss": test_loss,
+            "train_acc": train_acc, "val_acc": val_acc, "test_acc": test_acc,
+        }
+        telem_row.update({f"val_{metric_name}": val_metrics.get(metric_name, 0.0) for metric_name in scalar_metrics})
+        telem_row.update({f"test_{metric_name}": test_metrics.get(metric_name, 0.0) for metric_name in scalar_metrics})
         telemetry.log_epoch(epoch, telem_row)
 
         if args.early_stopping:
@@ -198,30 +316,45 @@ def train_classification(args):
     # ── Plots ──
     epochs_range = range(1, len(history["train_loss"]) + 1)
     _plot_loss_acc(history, epochs_range, args.output_dir)
-    _plot_scalar_metrics(metric_history, epochs_range, args.output_dir)
+    _plot_cls_scalar_metrics(val_metric_history, test_metric_history, epochs_range, args.output_dir)
 
     if "confusion_matrix" in requested_metrics:
-        _plot_confusion_matrix(all_labels, all_preds, class_names, args.output_dir)
+        _plot_confusion_matrix(test_labels, test_preds, class_names, args.output_dir)
     if "auc_roc" in requested_metrics:
-        _plot_roc(all_labels, all_probs, class_names, num_classes, args.output_dir)
+        _plot_roc(test_labels, test_probs, class_names, num_classes, args.output_dir)
     if args.grad_cam:
         try:
-            _generate_gradcam(model, val_loader, device, args.output_dir, class_names, num_images=5)
+            _generate_gradcam(model, test_loader, device, args.output_dir, class_names, num_images=5)
         except Exception as e:
             print(f"Grad-CAM failed: {e}")
 
+    final_metrics = {
+        "val_loss": val_loss,
+        "test_loss": test_loss,
+        "val_accuracy": val_acc,
+        "test_accuracy": test_acc,
+    }
+    final_metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
+    final_metrics.update({f"test_{key}": value for key, value in test_metrics.items()})
+
     # ── Excel export ──
-    _export_cls_excel(history, metric_history, epoch_metrics, class_names,
-                      all_labels, all_preds, args.output_dir)
+    _export_cls_excel(
+        history, val_metric_history, test_metric_history, final_metrics, class_names,
+        val_labels, val_preds, test_labels, test_preds, args.output_dir,
+    )
 
     # ── Markdown report ──
     _generate_report(
-        "classification", args, epoch_metrics, history, args.output_dir,
+        "classification", args, final_metrics, history, args.output_dir,
         class_names=class_names,
-        extra_info=f"**Dataset:** {len(train_loader.dataset)} train / {len(val_loader.dataset)} test images",
+        extra_info=(
+            f"**Dataset:** {len(train_loader.dataset)} train / {len(val_loader.dataset)} validation / "
+            f"{len(test_loader.dataset)} test images  \n"
+            f"**Split mode:** {split_mode}  |  **Seed:** {args.seed}"
+        ),
     )
 
-    _print_summary(epoch_metrics, args.output_dir)
+    _print_summary(final_metrics, args.output_dir)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -232,6 +365,7 @@ def train_regression(args):
     from sklearn import metrics as sk_metrics
 
     os.makedirs(args.output_dir, exist_ok=True)
+    _set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Regression] Device: {device}")
 
@@ -275,7 +409,8 @@ def train_regression(args):
         full_ds = TensorDataset(X, y)
         val_size = int((1 - args.train_split) * len(full_ds))
         train_size = len(full_ds) - val_size
-        train_ds, val_ds = random_split(full_ds, [train_size, val_size])
+        split_generator = torch.Generator().manual_seed(args.seed)
+        train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=split_generator)
         print(f"Split: {train_size} train / {val_size} test")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
@@ -419,6 +554,114 @@ def train_regression(args):
 # ══════════════════════════════════════════════════════════════════════
 #  SHARED HELPERS
 # ══════════════════════════════════════════════════════════════════════
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _seed_worker(worker_id: int) -> None:
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _resolve_split_dir(root_dir: str, names: tuple) -> str:
+    for dirname in names:
+        candidate = os.path.join(root_dir, dirname)
+        if os.path.isdir(candidate):
+            return candidate
+    raise FileNotFoundError(f"Missing split folder in {root_dir}: expected one of {names}")
+
+
+def _ensure_class_names_match(reference_classes: list, candidate_classes: list, split_name: str) -> None:
+    if list(reference_classes) != list(candidate_classes):
+        raise ValueError(
+            f"Class folders in {split_name} do not match train classes. "
+            f"train={reference_classes}, {split_name}={candidate_classes}"
+        )
+
+
+def _ensure_non_empty_split(dataset, split_name: str) -> None:
+    if len(dataset) == 0:
+        raise ValueError(f"{split_name} split is empty. Adjust ratios or provide more data.")
+
+
+def _stratified_split_indices(
+    targets: list,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+    include_test: bool,
+) -> tuple:
+    ratio_sum = train_ratio + val_ratio + (test_ratio if include_test else 0.0)
+    if ratio_sum <= 0:
+        raise ValueError("Split ratios must sum to a positive value.")
+
+    normalized_train = train_ratio / ratio_sum
+    normalized_val = val_ratio / ratio_sum
+    rng = random.Random(seed)
+    class_to_indices = {}
+    for sample_index, target in enumerate(targets):
+        class_to_indices.setdefault(int(target), []).append(sample_index)
+
+    train_indices, val_indices, test_indices = [], [], []
+    for class_id in sorted(class_to_indices):
+        class_indices = list(class_to_indices[class_id])
+        rng.shuffle(class_indices)
+        total_count = len(class_indices)
+        train_count = round(total_count * normalized_train)
+        if include_test:
+            val_count = round(total_count * normalized_val)
+            if train_count + val_count > total_count:
+                val_count = max(0, total_count - train_count)
+            test_count = total_count - train_count - val_count
+        else:
+            val_count = total_count - train_count
+            test_count = 0
+
+        train_indices.extend(class_indices[:train_count])
+        val_indices.extend(class_indices[train_count:train_count + val_count])
+        if include_test:
+            test_indices.extend(class_indices[train_count + val_count:train_count + val_count + test_count])
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    rng.shuffle(test_indices)
+    return train_indices, val_indices, test_indices
+
+
+def _evaluate_cls(model, dataloader, criterion, device, requested_metrics, num_classes):
+    model.eval()
+    running_loss, correct, total = 0.0, 0, 0
+    all_labels, all_preds, all_probs = [], [], []
+    with torch.no_grad():
+        for imgs, labels in dataloader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            predictions = outputs.argmax(1)
+            running_loss += loss.item() * imgs.size(0)
+            correct += (predictions == labels).sum().item()
+            total += imgs.size(0)
+            all_labels.extend(labels.cpu().tolist())
+            all_preds.extend(predictions.cpu().tolist())
+            all_probs.extend(torch.softmax(outputs, dim=1).cpu().tolist())
+
+    if total == 0:
+        raise ValueError("Cannot evaluate an empty dataloader.")
+    loss_value = running_loss / total
+    accuracy = correct / total
+    metrics = _compute_cls_metrics(all_labels, all_preds, all_probs, requested_metrics, num_classes)
+    return loss_value, accuracy, metrics, all_labels, all_preds, all_probs
+
+
 def _build_optimizer(args, model):
     if args.optimizer == "adamw":
         return optim.AdamW(model.parameters(), lr=args.lr)
@@ -500,9 +743,15 @@ def _generate_report(
     lines.append("## Training Summary")
     lines.append("")
     lines.append(f"- **Best val loss:** {min(history['val_loss']):.4f}")
+    if "test_loss" in history:
+        lines.append(f"- **Best test loss:** {min(history['test_loss']):.4f}")
     if "val_acc" in history:
         lines.append(f"- **Best val accuracy:** {max(history['val_acc']):.4f}")
+    if "test_acc" in history:
+        lines.append(f"- **Best test accuracy:** {max(history['test_acc']):.4f}")
     lines.append(f"- **Final train loss:** {history['train_loss'][-1]:.4f}")
+    if "test_loss" in history:
+        lines.append(f"- **Final test loss:** {history['test_loss'][-1]:.4f}")
     lines.append("")
 
     # Output files
@@ -667,12 +916,54 @@ def _plot_loss_acc(history, epochs_range, output_dir):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     ax1.plot(epochs_range, history["train_loss"], label="Train")
     ax1.plot(epochs_range, history["val_loss"], label="Val")
-    ax1.set_title("Loss"); ax1.set_xlabel("Epoch"); ax1.legend()
+    if history.get("test_loss"):
+        ax1.plot(epochs_range, history["test_loss"], label="Test")
+    loss_values = history["train_loss"] + history["val_loss"] + history.get("test_loss", [])
+    loss_upper = max(loss_values) * 1.08 if loss_values and max(loss_values) > 0 else 1.0
+    ax1.set_ylim(0, loss_upper)
+    ax1.set_title("Loss"); ax1.set_xlabel("Epoch"); ax1.legend(); ax1.grid(alpha=0.25)
     ax2.plot(epochs_range, history["train_acc"], label="Train")
     ax2.plot(epochs_range, history["val_acc"], label="Val")
-    ax2.set_title("Accuracy"); ax2.set_xlabel("Epoch"); ax2.legend()
+    if history.get("test_acc"):
+        ax2.plot(epochs_range, history["test_acc"], label="Test")
+    ax2.set_ylim(0, 1)
+    ax2.set_title("Accuracy"); ax2.set_xlabel("Epoch"); ax2.legend(); ax2.grid(alpha=0.25)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "loss_accuracy.png"), dpi=150)
+    plt.close()
+
+
+def _plot_cls_scalar_metrics(val_metric_history, test_metric_history, epochs_range, output_dir):
+    metric_names = [
+        metric_name for metric_name in val_metric_history
+        if val_metric_history.get(metric_name) or test_metric_history.get(metric_name)
+    ]
+    if not metric_names:
+        return
+    cols = min(3, len(metric_names))
+    rows = (len(metric_names) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+    for index, metric_name in enumerate(metric_names):
+        ax = axes[index // cols][index % cols]
+        val_values = val_metric_history.get(metric_name, [])
+        test_values = test_metric_history.get(metric_name, [])
+        if val_values:
+            ax.plot(epochs_range, val_values, marker="o", markersize=3, label="Val")
+        if test_values:
+            ax.plot(epochs_range, test_values, marker="o", markersize=3, label="Test")
+        title = metric_name.replace("_", " ").title()
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        if metric_name == "cohen_kappa":
+            ax.set_ylim(-1, 1)
+        else:
+            ax.set_ylim(0, 1)
+        ax.grid(alpha=0.25)
+        ax.legend()
+    for index in range(len(metric_names), rows * cols):
+        axes[index // cols][index % cols].set_visible(False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "metrics.png"), dpi=150)
     plt.close()
 
 
@@ -768,8 +1059,8 @@ def _generate_gradcam(model, dataloader, device, output_dir, class_names, num_im
 
 
 # ── Excel export ─────────────────────────────────────────────────────
-def _export_cls_excel(history, metric_history, final_metrics, class_names,
-                      all_labels, all_preds, output_dir):
+def _export_cls_excel(history, val_metric_history, test_metric_history, final_metrics, class_names,
+                      val_labels, val_preds, test_labels, test_preds, output_dir):
     """Save classification results to Excel (multiple sheets)."""
     import pandas as pd
     path = os.path.join(output_dir, "results.xlsx")
@@ -779,11 +1070,15 @@ def _export_cls_excel(history, metric_history, final_metrics, class_names,
             "epoch": list(range(1, len(history["train_loss"]) + 1)),
             "train_loss": history["train_loss"],
             "val_loss": history["val_loss"],
+            "test_loss": history["test_loss"],
             "train_acc": history["train_acc"],
             "val_acc": history["val_acc"],
+            "test_acc": history["test_acc"],
         })
-        for m, vals in metric_history.items():
-            df_hist[m] = vals
+        for metric_name, values in val_metric_history.items():
+            df_hist[f"val_{metric_name}"] = values
+        for metric_name, values in test_metric_history.items():
+            df_hist[f"test_{metric_name}"] = values
         df_hist.to_excel(w, sheet_name="Epoch History", index=False)
 
         # Final metrics
@@ -791,13 +1086,21 @@ def _export_cls_excel(history, metric_history, final_metrics, class_names,
         df_final.to_excel(w, sheet_name="Final Metrics", index=False)
 
         # Predictions
-        df_preds = pd.DataFrame({
-            "actual": all_labels,
-            "predicted": all_preds,
-            "actual_class": [class_names[i] for i in all_labels],
-            "predicted_class": [class_names[i] for i in all_preds],
+        df_val_preds = pd.DataFrame({
+            "actual": val_labels,
+            "predicted": val_preds,
+            "actual_class": [class_names[index] for index in val_labels],
+            "predicted_class": [class_names[index] for index in val_preds],
         })
-        df_preds.to_excel(w, sheet_name="Predictions", index=False)
+        df_val_preds.to_excel(w, sheet_name="Validation Predictions", index=False)
+
+        df_test_preds = pd.DataFrame({
+            "actual": test_labels,
+            "predicted": test_preds,
+            "actual_class": [class_names[index] for index in test_labels],
+            "predicted_class": [class_names[index] for index in test_preds],
+        })
+        df_test_preds.to_excel(w, sheet_name="Test Predictions", index=False)
 
     print(f"Excel report saved: {path}")
 
