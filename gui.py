@@ -286,6 +286,26 @@ class App(ctk.CTk):
         )
 
         row += 1
+        # ── Resize (classification only) ──
+        ctk.CTkLabel(f, text="Resize:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
+        self.resize_frame = ctk.CTkFrame(f, fg_color="transparent")
+        self.resize_frame.grid(row=row, column=1, columnspan=6, padx=5, pady=4, sticky="w")
+        self.resize_enabled_var = ctk.BooleanVar(value=True)
+        self.resize_cb = ctk.CTkCheckBox(
+            self.resize_frame, text="Enable", variable=self.resize_enabled_var,
+            command=self._on_resize_toggled,
+        )
+        self.resize_cb.pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(self.resize_frame, text="width").pack(side="left", padx=(0, 2))
+        self.resize_width_var = ctk.StringVar(value="224")
+        self.resize_width_entry = ctk.CTkEntry(self.resize_frame, textvariable=self.resize_width_var, width=60)
+        self.resize_width_entry.pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(self.resize_frame, text="height").pack(side="left", padx=(0, 2))
+        self.resize_height_var = ctk.StringVar(value="224")
+        self.resize_height_entry = ctk.CTkEntry(self.resize_frame, textvariable=self.resize_height_var, width=60)
+        self.resize_height_entry.pack(side="left", padx=(0, 8))
+
+        row += 1
         # ── Augmentation (classification only) ──
         self.aug_label = ctk.CTkLabel(f, text="Augmentation:")
         self.aug_label.grid(row=row, column=0, padx=5, pady=4, sticky="ne")
@@ -385,6 +405,14 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+    def _on_resize_toggled(self) -> None:
+        """Enable/disable resize dimension inputs."""
+        is_classification = self.task_type_var.get() == "Classification"
+        state = "normal" if is_classification and self.resize_enabled_var.get() else "disabled"
+        self.resize_cb.configure(state="normal" if is_classification else "disabled")
+        self.resize_width_entry.configure(state=state)
+        self.resize_height_entry.configure(state=state)
+
     # ------------------------------------------------------------------
     def _on_task_type_changed(self, choice: str) -> None:
         """Show/hide fields based on classification vs regression."""
@@ -414,6 +442,7 @@ class App(ctk.CTk):
             self.label_smooth_cb.configure(state="normal")
             self.test_data_label.configure(text="Test Data:")
         self._on_pre_split_toggled()
+        self._on_resize_toggled()
 
     # ------------------------------------------------------------------
     def _build_buttons(self, parent: ctk.CTkFrame) -> None:
@@ -546,8 +575,12 @@ class App(ctk.CTk):
         self.min_gpu_ram_var.set(cfg.get("min_gpu_ram", "8"))
         self.max_price_var.set(cfg.get("max_price", "1.0"))
         self.max_samples_var.set(str(cfg.get("max_samples_per_class", 0)))
+        self.resize_enabled_var.set(bool(cfg.get("resize_enabled", True)))
+        self.resize_width_var.set(str(cfg.get("resize_width", 224)))
+        self.resize_height_var.set(str(cfg.get("resize_height", 224)))
         self._on_task_type_changed(self.task_type_var.get())
         self._on_use_builtin_toggled()
+        self._on_resize_toggled()
 
     def _save_user_config(self) -> None:
         """Persist current GUI settings to user_config.json."""
@@ -573,6 +606,9 @@ class App(ctk.CTk):
             "min_gpu_ram": self.min_gpu_ram_var.get(),
             "max_price": self.max_price_var.get(),
             "max_samples_per_class": int(self.max_samples_var.get() or 0),
+            "resize_enabled": self.resize_enabled_var.get(),
+            "resize_width": self.resize_width_var.get(),
+            "resize_height": self.resize_height_var.get(),
         }
         try:
             with open(_USER_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -627,6 +663,15 @@ class App(ctk.CTk):
         cfg.random_rotation = self.aug_rotation_var.get()
         cfg.horizontal_flip = self.aug_hflip_var.get()
         cfg.random_erasing = self.aug_erasing_var.get()
+        cfg.resize_enabled = self.resize_enabled_var.get()
+        try:
+            cfg.resize_width = int(self.resize_width_var.get())
+        except ValueError:
+            cfg.resize_width = 224
+        try:
+            cfg.resize_height = int(self.resize_height_var.get())
+        except ValueError:
+            cfg.resize_height = 224
         # Features
         cfg.early_stopping = self.early_stop_var.get()
         cfg.early_stopping_patience = self.patience_var.get()
@@ -690,6 +735,14 @@ class App(ctk.CTk):
             return f"Test Data folder not found: {test_path}"
         if not self.output_path_var.get().strip():
             return "Output Path is required."
+        if self.task_type_var.get() == "Classification" and self.resize_enabled_var.get():
+            try:
+                resize_width = int(self.resize_width_var.get())
+                resize_height = int(self.resize_height_var.get())
+            except ValueError:
+                return "Resize width and height must be integers."
+            if resize_width <= 0 or resize_height <= 0:
+                return "Resize width and height must be greater than 0, or disable resize."
         ssh_key = self.ssh_key_var.get().strip()
         if not ssh_key:
             return "SSH Key path is required."

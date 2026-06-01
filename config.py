@@ -42,6 +42,11 @@ class ExperimentConfig:
     horizontal_flip: bool = False
     random_erasing: bool = False
 
+    # Image preprocessing (classification only)
+    resize_enabled: bool = True
+    resize_width: int = 224
+    resize_height: int = 224
+
     # Test mode
     use_builtin: bool = False  # Use CIFAR-100 instead of user dataset
 
@@ -126,6 +131,10 @@ class ExperimentConfig:
 
         # Augmentation (classification only)
         if self.task_type == "classification":
+            if self.resize_enabled:
+                parts.append(f"--resize_width {self.resize_width} --resize_height {self.resize_height}")
+            else:
+                parts.append("--no_resize")
             if self.random_rotation:
                 parts.append("--random_rotation")
             if self.horizontal_flip:

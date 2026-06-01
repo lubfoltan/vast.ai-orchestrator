@@ -59,6 +59,9 @@ def parse_args():
     p.add_argument("--random_rotation", action="store_true")
     p.add_argument("--horizontal_flip", action="store_true")
     p.add_argument("--random_erasing", action="store_true")
+    p.add_argument("--resize_width", type=int, default=224)
+    p.add_argument("--resize_height", type=int, default=224)
+    p.add_argument("--no_resize", action="store_true")
     # Feature flags
     p.add_argument("--early_stopping", action="store_true")
     p.add_argument("--patience", type=int, default=7)
@@ -87,22 +90,28 @@ def train_classification(args):
 
     requested_metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
     print(f"Metrics: {requested_metrics}")
+    if args.no_resize:
+        print("Resize: disabled")
+    else:
+        print(f"Resize: {args.resize_width}x{args.resize_height}")
 
     train_tfm, val_tfm = _build_cls_transforms(args)
 
     if getattr(args, "use_builtin", False):
         print("[Test Mode] Using built-in CIFAR-100 dataset")
-        cifar_train_tfm = transforms.Compose([
-            transforms.Resize((224, 224)),
+        cifar_train_steps = _resize_steps(args, transforms)
+        cifar_train_steps += [
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761]),
-        ])
-        cifar_val_tfm = transforms.Compose([
-            transforms.Resize((224, 224)),
+        ]
+        cifar_val_steps = _resize_steps(args, transforms)
+        cifar_val_steps += [
             transforms.ToTensor(),
             transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761]),
-        ])
+        ]
+        cifar_train_tfm = transforms.Compose(cifar_train_steps)
+        cifar_val_tfm = transforms.Compose(cifar_val_steps)
         train_source_ds = datasets.CIFAR100(root=args.data_dir, train=True, download=True, transform=cifar_train_tfm)
         eval_source_ds = datasets.CIFAR100(root=args.data_dir, train=True, download=True, transform=cifar_val_tfm)
         test_ds = datasets.CIFAR100(root=args.data_dir, train=False, download=True, transform=cifar_val_tfm)
@@ -785,7 +794,7 @@ def _print_summary(metrics_dict, output_dir):
 # ── Classification helpers ───────────────────────────────────────────
 def _build_cls_transforms(args):
     from torchvision import transforms
-    train_tfms = [transforms.Resize((224, 224))]
+    train_tfms = _resize_steps(args, transforms)
     if args.random_rotation:
         train_tfms.append(transforms.RandomRotation(15))
     if args.horizontal_flip:
@@ -794,9 +803,18 @@ def _build_cls_transforms(args):
                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
     if args.random_erasing:
         train_tfms.append(transforms.RandomErasing())
-    val_tfms = [transforms.Resize((224, 224)), transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
+    val_tfms = _resize_steps(args, transforms)
+    val_tfms += [transforms.ToTensor(),
+                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
     return transforms.Compose(train_tfms), transforms.Compose(val_tfms)
+
+
+def _resize_steps(args, transforms):
+    if getattr(args, "no_resize", False):
+        return []
+    if args.resize_width <= 0 or args.resize_height <= 0:
+        raise ValueError("resize_width and resize_height must be positive integers, or use --no_resize")
+    return [transforms.Resize((args.resize_height, args.resize_width))]
 
 
 def _build_cls_model(name, num_classes):
@@ -1040,23 +1058,36 @@ def _generate_gradcam(model, dataloader, device, output_dir, class_names, num_im
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
     done = 0
+    per_class_limit = max(1, int(np.ceil(num_images / max(len(class_names), 1))))
+    class_counts = {index: 0 for index in range(len(class_names))}
     for imgs, labels in dataloader:
         imgs = imgs.to(device)
+        with torch.no_grad():
+            preds = model(imgs).argmax(1).cpu().tolist()
         for i in range(imgs.size(0)):
             if done >= num_images:
                 return
+            true_index = labels[i].item()
+            if class_counts.get(true_index, 0) >= per_class_limit:
+                continue
             inp = imgs[i].unsqueeze(0)
-            target = [ClassifierOutputTarget(labels[i].item())]
+            pred_index = preds[i]
+            target = [ClassifierOutputTarget(pred_index)]
             gc = cam(input_tensor=inp, targets=target)[0]
             rgb = imgs[i].cpu().numpy().transpose(1, 2, 0)
             rgb = np.clip(rgb * std + mean, 0, 1).astype(np.float32)
             overlay = show_cam_on_image(rgb, gc, use_rgb=True)
             fig, ax = plt.subplots(1, 1, figsize=(4, 4))
             ax.imshow(overlay)
-            ax.set_title(f"Grad-CAM — {class_names[labels[i].item()]}")
+            ax.set_title(f"Grad-CAM — true {class_names[true_index]} / pred {class_names[pred_index]}")
             ax.axis("off")
-            plt.savefig(os.path.join(output_dir, f"gradcam_{done}.png"), dpi=100, bbox_inches="tight")
+            plt.savefig(
+                os.path.join(output_dir, f"gradcam_{done}_true_{class_names[true_index]}_pred_{class_names[pred_index]}.png"),
+                dpi=100,
+                bbox_inches="tight",
+            )
             plt.close()
+            class_counts[true_index] = class_counts.get(true_index, 0) + 1
             done += 1
 
 

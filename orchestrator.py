@@ -194,6 +194,67 @@ def collect_class_files():
             class_files[cls] = files
     return class_files
 
+def group_key(cls, source_path):
+    stem = os.path.splitext(os.path.basename(source_path))[0]
+    stem = re.sub(r'_aug_\d+$', '', stem, flags=re.I)
+    match = re.search(r'(person\d+)', stem, re.I)
+    if match:
+        return f"{cls}:{match.group(1).lower()}"
+    match = re.search(r'(NORMAL2-IM-\d+|IM-\d+)', stem, re.I)
+    if match:
+        return f"{cls}:{match.group(1).lower()}"
+    return f"{cls}:{stem.lower()}"
+
+def split_groups_for_class(cls, files):
+    groups_by_key = {}
+    for source_path in files:
+        groups_by_key.setdefault(group_key(cls, source_path), []).append(source_path)
+
+    positive_splits = [name for name in split_names if ratios[name] > 0]
+    if len(groups_by_key) < len(positive_splits):
+        print(
+            f"ERROR: Class {cls} has only {len(groups_by_key)} patient/source groups, "
+            f"but {len(positive_splits)} non-empty splits are requested."
+        )
+        sys.exit(1)
+
+    groups = sorted(groups_by_key.items(), key=lambda item: (len(item[1]), item[0]), reverse=True)
+    target_counts = split_counts(sum(len(paths) for _, paths in groups))
+    assigned = {name: [] for name in split_names}
+    assigned_counts = {name: 0 for name in split_names}
+
+    # First guarantee every requested split has this class represented.
+    ordered_splits = sorted(positive_splits, key=lambda name: target_counts[name], reverse=True)
+    seed_plan = []
+    if ordered_splits:
+        seed_plan.append((ordered_splits[0], groups.pop(0)))
+        for split_name in sorted(ordered_splits[1:], key=lambda name: target_counts[name]):
+            seed_plan.append((split_name, groups.pop()))
+    for split_name, (_, paths) in seed_plan:
+        assigned[split_name].extend(paths)
+        assigned_counts[split_name] += len(paths)
+
+    remaining = groups
+    rng = random.Random(f"{seed}:{cls}:groups")
+    rng.shuffle(remaining)
+    remaining.sort(key=lambda item: len(item[1]), reverse=True)
+    for _, paths in remaining:
+        best_split = max(
+            positive_splits,
+            key=lambda name: (
+                (target_counts[name] - assigned_counts[name]) / max(target_counts[name], 1),
+                target_counts[name] - assigned_counts[name],
+            ),
+        )
+        assigned[best_split].extend(paths)
+        assigned_counts[best_split] += len(paths)
+
+    print(
+        f"{cls}: {len(files)} images in {len(groups_by_key)} patient/source groups -> "
+        f"{assigned_counts} (requested {target_counts})"
+    )
+    return assigned
+
 def split_counts(total):
     ratio_sum = sum(ratios.values())
     if ratio_sum <= 0:
@@ -330,25 +391,21 @@ for split_name in split_names:
         sys.exit(1)
 
 class_sizes = {cls: len(files) for cls, files in class_files.items()}
-class_split_counts = {cls: split_counts(len(files)) for cls, files in class_files.items()}
-rebalance_to_global_targets(class_split_counts, class_sizes, target_totals)
+class_assignments = {
+    cls: split_groups_for_class(cls, files)
+    for cls, files in sorted(class_files.items())
+}
 
 shutil.rmtree(tmp_root, ignore_errors=True)
 for split_name in split_names:
     os.makedirs(os.path.join(tmp_root, split_name), exist_ok=True)
 
-for cls in sorted(class_files):
-    files = class_files[cls]
-    rng = random.Random(f"{seed}:{cls}")
-    rng.shuffle(files)
-    counts = class_split_counts[cls]
-    print(f"{cls}: splitting {len(files)} images -> {counts}")
-    offset = 0
+for cls in sorted(class_assignments):
+    assignments = class_assignments[cls]
     for split_name in split_names:
-        count = counts[split_name]
         dest_dir = os.path.join(tmp_root, split_name, cls)
         os.makedirs(dest_dir, exist_ok=True)
-        for source_path in files[offset:offset + count]:
+        for source_path in assignments[split_name]:
             filename = os.path.basename(source_path)
             dest_path = os.path.join(dest_dir, filename)
             if os.path.exists(dest_path):
@@ -358,7 +415,6 @@ for cls in sorted(class_files):
                     dest_path = os.path.join(dest_dir, f"{base}_{suffix}{ext}")
                     suffix += 1
             shutil.move(source_path, dest_path)
-        offset += count
 
 for entry in os.listdir(root):
     path = os.path.join(root, entry)
@@ -370,7 +426,7 @@ for split_name in split_names:
     shutil.move(os.path.join(tmp_root, split_name), os.path.join(root, split_name))
 shutil.rmtree(tmp_root, ignore_errors=True)
 
-validate_split_dirs(target_totals)
+validate_split_dirs()
 print("Auto split dataset OK.")
 '''
 
