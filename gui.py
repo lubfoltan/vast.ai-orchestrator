@@ -370,9 +370,13 @@ class App(ctk.CTk):
         builtin = self.use_builtin_var.get()
         pre_split = self.pre_split_data_var.get()
         is_regression = self.task_type_var.get() == "Regression"
+        data_state = "disabled" if builtin else "normal"
         test_state = "normal" if is_regression and not builtin and not pre_split else "disabled"
         ratio_state = "disabled" if pre_split else "normal"
 
+        self._data_entry.configure(state=data_state)
+        self._data_browse_btn.configure(state=data_state)
+        self.pre_split_data_cb.configure(state=data_state)
         self._test_data_entry.configure(state=test_state)
         self._test_data_browse_btn.configure(state=test_state)
         for child in self.ratio_frame.winfo_children():

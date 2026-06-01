@@ -123,6 +123,11 @@ ratios = {
 }
 split_names = ("train", "val", "test")
 split_aliases = {"train", "val", "validation", "test"}
+input_split_options = {
+    "train": ("train",),
+    "val": ("val", "validation"),
+    "test": ("test",),
+}
 exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
 
 def image_files(path):
@@ -147,6 +152,47 @@ def organize_flat_files():
         os.makedirs(class_dir, exist_ok=True)
         for filename in filenames:
             shutil.move(os.path.join(root, filename), os.path.join(class_dir, filename))
+
+def collect_class_files():
+    resolved_splits = {}
+    for split_name, aliases in input_split_options.items():
+        for alias in aliases:
+            candidate = os.path.join(root, alias)
+            if os.path.isdir(candidate):
+                resolved_splits[split_name] = candidate
+                break
+
+    if resolved_splits:
+        missing = [name for name in split_names if name not in resolved_splits]
+        if missing:
+            print(f"ERROR: Found partial split folders, missing: {missing}")
+            print("Provide train/val/test (or validation) folders, or provide only class folders like NORMAL/PNEUMONIA.")
+            sys.exit(1)
+        class_files = {}
+        print("Pooling existing train/val/test folders by class before re-splitting.")
+        for split_name in split_names:
+            split_dir = resolved_splits[split_name]
+            for cls in sorted(os.listdir(split_dir)):
+                cls_dir = os.path.join(split_dir, cls)
+                if not os.path.isdir(cls_dir):
+                    continue
+                files = [os.path.join(cls_dir, filename) for filename in image_files(cls_dir)]
+                if files:
+                    class_files.setdefault(cls, []).extend(files)
+        return class_files
+
+    organize_flat_files()
+    class_dirs = [
+        d for d in sorted(os.listdir(root))
+        if os.path.isdir(os.path.join(root, d)) and d not in split_aliases
+    ]
+    class_files = {}
+    for cls in class_dirs:
+        cls_dir = os.path.join(root, cls)
+        files = [os.path.join(cls_dir, filename) for filename in image_files(cls_dir)]
+        if files:
+            class_files[cls] = files
+    return class_files
 
 def split_counts(total):
     ratio_sum = sum(ratios.values())
@@ -266,36 +312,19 @@ def validate_split_dirs(expected_totals=None):
         print(f"{split_name}: {split_total}/{total} images ({actual_pct:.2f}%, requested {requested_pct:.2f}%) per class {counts[split_name]}")
     return counts
 
-existing_splits = [name for name in split_names if os.path.isdir(os.path.join(root, name))]
-if existing_splits:
-    print("Dataset already contains split folders on remote; validating existing split.")
-    validate_split_dirs()
-    sys.exit(0)
-
-organize_flat_files()
-class_dirs = [
-    d for d in sorted(os.listdir(root))
-    if os.path.isdir(os.path.join(root, d)) and d not in split_aliases
-]
-if not class_dirs:
+class_files = collect_class_files()
+if not class_files:
     print("ERROR: No class folders found. Expected folders like NORMAL/ and PNEUMONIA/.")
     sys.exit(1)
 
-class_files = {}
-for cls in class_dirs:
-    files = image_files(os.path.join(root, cls))
-    if not files:
-        print(f"ERROR: Class folder {cls} has no supported image files.")
-        sys.exit(1)
-    class_files[cls] = files
-
 total_images = sum(len(files) for files in class_files.values())
 target_totals = split_counts(total_images)
+class_count = len(class_files)
 for split_name in split_names:
-    if ratios[split_name] > 0 and target_totals[split_name] < len(class_dirs):
+    if ratios[split_name] > 0 and target_totals[split_name] < class_count:
         print(
             f"ERROR: Requested {split_name} ratio gives only {target_totals[split_name]} images, "
-            f"but {len(class_dirs)} classes must be represented."
+            f"but {class_count} classes must be represented."
         )
         print("Add more images or increase this split ratio.")
         sys.exit(1)
@@ -308,8 +337,7 @@ shutil.rmtree(tmp_root, ignore_errors=True)
 for split_name in split_names:
     os.makedirs(os.path.join(tmp_root, split_name), exist_ok=True)
 
-for cls in class_dirs:
-    src_dir = os.path.join(root, cls)
+for cls in sorted(class_files):
     files = class_files[cls]
     rng = random.Random(f"{seed}:{cls}")
     rng.shuffle(files)
@@ -320,8 +348,16 @@ for cls in class_dirs:
         count = counts[split_name]
         dest_dir = os.path.join(tmp_root, split_name, cls)
         os.makedirs(dest_dir, exist_ok=True)
-        for filename in files[offset:offset + count]:
-            shutil.move(os.path.join(src_dir, filename), os.path.join(dest_dir, filename))
+        for source_path in files[offset:offset + count]:
+            filename = os.path.basename(source_path)
+            dest_path = os.path.join(dest_dir, filename)
+            if os.path.exists(dest_path):
+                base, ext = os.path.splitext(filename)
+                suffix = 1
+                while os.path.exists(dest_path):
+                    dest_path = os.path.join(dest_dir, f"{base}_{suffix}{ext}")
+                    suffix += 1
+            shutil.move(source_path, dest_path)
         offset += count
 
 for entry in os.listdir(root):
