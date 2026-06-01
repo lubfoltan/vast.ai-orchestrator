@@ -204,6 +204,13 @@ class App(ctk.CTk):
         )
         self.use_builtin_cb.grid(row=row, column=1, columnspan=3, padx=5, pady=4, sticky="w")
 
+        self.three_class_var = ctk.BooleanVar(value=False)
+        self.three_class_cb = ctk.CTkCheckBox(
+            f, text="Three-class classification", variable=self.three_class_var,
+            command=self._on_three_class_toggled,
+        )
+        self.three_class_cb.grid(row=row, column=4, columnspan=3, padx=5, pady=4, sticky="w")
+
         row += 1
         # ── API Key ──
         ctk.CTkLabel(f, text="API Key:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
@@ -363,7 +370,10 @@ class App(ctk.CTk):
 
         if task_type == "Classification":
             choices = ExperimentConfig.CLASSIFICATION_METRICS
-            defaults_on = {"accuracy", "loss", "precision", "recall", "f1_score", "auc_roc", "confusion_matrix"}
+            if getattr(self, "three_class_var", None) and self.three_class_var.get():
+                defaults_on = set(ExperimentConfig.THREE_CLASS_CLASSIFICATION_METRICS)
+            else:
+                defaults_on = {"accuracy", "loss", "precision", "recall", "f1_score", "auc_roc", "confusion_matrix"}
         else:
             choices = ExperimentConfig.REGRESSION_METRICS
             defaults_on = {"mse", "rmse", "mae", "r2", "loss"}
@@ -374,6 +384,19 @@ class App(ctk.CTk):
             label = m.replace("_", " ").upper() if m in ("mse", "rmse", "mae", "r2", "mape") else m.replace("_", " ").title()
             ctk.CTkCheckBox(self.met_frame, text=label, variable=var).pack(side="left", padx=5)
 
+    def _apply_classification_metric_preset(self) -> None:
+        if self.task_type_var.get() != "Classification":
+            return
+        if self.three_class_var.get():
+            enabled = set(ExperimentConfig.THREE_CLASS_CLASSIFICATION_METRICS)
+        else:
+            enabled = {"accuracy", "loss", "precision", "recall", "f1_score", "auc_roc", "confusion_matrix"}
+        for metric_name, var in self.metric_vars.items():
+            var.set(metric_name in enabled)
+
+    def _on_three_class_toggled(self) -> None:
+        self._apply_classification_metric_preset()
+
     # ------------------------------------------------------------------
     def _on_use_builtin_toggled(self) -> None:
         """Enable/disable data path inputs when test mode is toggled."""
@@ -382,6 +405,9 @@ class App(ctk.CTk):
         self._data_entry.configure(state=state)
         self._data_browse_btn.configure(state=state)
         self.pre_split_data_cb.configure(state=state)
+        if hasattr(self, "three_class_cb"):
+            three_class_state = "normal" if not builtin and self.task_type_var.get() == "Classification" else "disabled"
+            self.three_class_cb.configure(state=three_class_state)
         self._on_pre_split_toggled()
 
     # ------------------------------------------------------------------
@@ -430,6 +456,7 @@ class App(ctk.CTk):
             self.grad_cam_cb.configure(state="disabled")
             self.mixup_cb.configure(state="disabled")
             self.label_smooth_cb.configure(state="disabled")
+            self.three_class_cb.configure(state="disabled")
             self.test_data_label.configure(text="Test Data:")
         else:
             # Hide regression fields
@@ -440,6 +467,7 @@ class App(ctk.CTk):
             self.grad_cam_cb.configure(state="normal")
             self.mixup_cb.configure(state="normal")
             self.label_smooth_cb.configure(state="normal")
+            self.three_class_cb.configure(state="normal" if not self.use_builtin_var.get() else "disabled")
             self.test_data_label.configure(text="Test Data:")
         self._on_pre_split_toggled()
         self._on_resize_toggled()
@@ -563,6 +591,7 @@ class App(ctk.CTk):
         self.task_type_var.set(cfg.get("task_type", "Classification"))
         self.use_builtin_var.set(bool(cfg.get("use_builtin", False)))
         self.pre_split_data_var.set(bool(cfg.get("pre_split_data", False)))
+        self.three_class_var.set(bool(cfg.get("three_class_classification", False)))
         self.model_var.set(cfg.get("model", "ResNet-50"))
         self.optimizer_var.set(cfg.get("optimizer", "AdamW"))
         self.lr_var.set(cfg.get("learning_rate", "0.001"))
@@ -594,6 +623,7 @@ class App(ctk.CTk):
             "task_type": self.task_type_var.get(),
             "use_builtin": self.use_builtin_var.get(),
             "pre_split_data": self.pre_split_data_var.get(),
+            "three_class_classification": self.three_class_var.get(),
             "model": self.model_var.get(),
             "optimizer": self.optimizer_var.get(),
             "learning_rate": self.lr_var.get(),
@@ -626,6 +656,7 @@ class App(ctk.CTk):
         cfg.task_type = self.task_type_var.get().lower()
         cfg.use_builtin = self.use_builtin_var.get()
         cfg.pre_split_data = self.pre_split_data_var.get()
+        cfg.three_class_classification = self.three_class_var.get()
         cfg.data_path = self.data_path_var.get().strip()
         cfg.test_data_path = self.test_data_path_var.get().strip()
         cfg.output_path = self.output_path_var.get().strip()

@@ -47,6 +47,9 @@ class ExperimentConfig:
     resize_width: int = 224
     resize_height: int = 224
 
+    # Classification mode hint for GUI metric presets.
+    three_class_classification: bool = False
+
     # Test mode
     use_builtin: bool = False  # Use CIFAR-100 instead of user dataset
 
@@ -83,7 +86,13 @@ class ExperimentConfig:
     OPTIMIZER_CHOICES = ["AdamW", "SGD"]
 
     CLASSIFICATION_METRICS = [
-        "accuracy", "loss", "precision", "recall",
+        "accuracy", "balanced_accuracy", "loss", "precision", "recall",
+        "f1_score", "auc_roc", "confusion_matrix",
+        "specificity", "sensitivity", "cohen_kappa",
+    ]
+
+    THREE_CLASS_CLASSIFICATION_METRICS = [
+        "balanced_accuracy", "loss", "precision", "recall",
         "f1_score", "auc_roc", "confusion_matrix",
         "specificity", "sensitivity", "cohen_kappa",
     ]

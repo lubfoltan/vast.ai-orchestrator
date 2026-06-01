@@ -850,6 +850,8 @@ def _compute_cls_metrics(all_labels, all_preds, all_probs, metric_names, num_cla
 
     if "accuracy" in metric_names:
         results["accuracy"] = sk_metrics.accuracy_score(labels_np, preds_np)
+    if "balanced_accuracy" in metric_names:
+        results["balanced_accuracy"] = sk_metrics.balanced_accuracy_score(labels_np, preds_np)
     if "precision" in metric_names:
         avg = "binary" if num_classes == 2 else "macro"
         results["precision"] = sk_metrics.precision_score(labels_np, preds_np, average=avg, zero_division=0)
