@@ -326,7 +326,9 @@ def train_classification(args):
         try:
             _generate_gradcam(model, test_loader, device, args.output_dir, class_names, num_images=5)
         except Exception as e:
+            import traceback
             print(f"Grad-CAM failed: {e}")
+            traceback.print_exc()
 
     final_metrics = {
         "val_loss": val_loss,

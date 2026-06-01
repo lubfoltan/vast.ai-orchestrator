@@ -106,7 +106,7 @@ class ExperimentConfig:
             f"--seed {self.seed}",
         ]
 
-        if self.pre_split_data and not self.use_builtin:
+        if not self.use_builtin and self.task_type == "classification":
             parts.append("--pre_split_data")
 
         # Built-in test dataset
@@ -114,7 +114,7 @@ class ExperimentConfig:
             parts.append("--use_builtin")
 
         # Test data
-        if self.test_data_path and not self.use_builtin and not self.pre_split_data:
+        if self.test_data_path and not self.use_builtin and not self.pre_split_data and self.task_type == "regression":
             parts.append("--test_dir /workspace/test_data")
 
         # Regression columns

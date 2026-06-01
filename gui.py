@@ -152,12 +152,13 @@ class App(ctk.CTk):
         ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_output).grid(row=row, column=6, padx=2)
 
         row += 1
-        ctk.CTkLabel(f, text="Test Data:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
+        self.test_data_label = ctk.CTkLabel(f, text="Test Data:")
+        self.test_data_label.grid(row=row, column=0, padx=5, pady=4, sticky="e")
         self.test_data_path_var = ctk.StringVar()
         self._test_data_entry = ctk.CTkEntry(
             f,
             textvariable=self.test_data_path_var,
-            placeholder_text="(Optional separate test set; ignored for pre-split data)",
+            placeholder_text="(Regression only; classification uses train/val/test split ratios)",
         )
         self._test_data_entry.grid(row=row, column=1, columnspan=2, padx=5, pady=4, sticky="ew")
         self._test_data_browse_btn = ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_test_data)
@@ -368,7 +369,8 @@ class App(ctk.CTk):
         """Toggle fields that only apply when SCOUT creates the split."""
         builtin = self.use_builtin_var.get()
         pre_split = self.pre_split_data_var.get()
-        test_state = "disabled" if builtin or pre_split else "normal"
+        is_regression = self.task_type_var.get() == "Regression"
+        test_state = "normal" if is_regression and not builtin and not pre_split else "disabled"
         ratio_state = "disabled" if pre_split else "normal"
 
         self._test_data_entry.configure(state=test_state)
@@ -396,6 +398,7 @@ class App(ctk.CTk):
             self.grad_cam_cb.configure(state="disabled")
             self.mixup_cb.configure(state="disabled")
             self.label_smooth_cb.configure(state="disabled")
+            self.test_data_label.configure(text="Test Data:")
         else:
             # Hide regression fields
             self.regression_frame.grid_remove()
@@ -405,10 +408,12 @@ class App(ctk.CTk):
             self.grad_cam_cb.configure(state="normal")
             self.mixup_cb.configure(state="normal")
             self.label_smooth_cb.configure(state="normal")
+            self.test_data_label.configure(text="Test Data:")
+        self._on_pre_split_toggled()
 
     # ------------------------------------------------------------------
     def _build_buttons(self, parent: ctk.CTkFrame) -> None:
-        parent.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6), weight=1)
+        parent.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6, 7), weight=1)
 
         self.btn_start = ctk.CTkButton(parent, text="▶  Start Pipeline", command=self._on_start, fg_color="green")
         self.btn_start.grid(row=0, column=0, padx=6, pady=8, sticky="ew")
@@ -436,18 +441,23 @@ class App(ctk.CTk):
         )
         self.btn_files.grid(row=0, column=5, padx=6, pady=8, sticky="ew")
 
+        self.btn_download = ctk.CTkButton(
+            parent, text="⬇  Download Results", command=self._on_download_results, state="disabled"
+        )
+        self.btn_download.grid(row=0, column=6, padx=6, pady=8, sticky="ew")
+
         self.btn_chart = ctk.CTkButton(
             parent, text="📈  Live Chart", command=self._on_toggle_chart,
             state="normal" if _HAS_MATPLOTLIB else "disabled"
         )
-        self.btn_chart.grid(row=0, column=6, padx=6, pady=8, sticky="ew")
+        self.btn_chart.grid(row=0, column=7, padx=6, pady=8, sticky="ew")
 
         self.btn_clear = ctk.CTkButton(parent, text="Clear Log", command=self._clear_log, fg_color="gray")
         self.btn_clear.grid(row=1, column=0, padx=6, pady=(0, 6), sticky="ew")
 
         # Status label for attach mode
         self._status_label = ctk.CTkLabel(parent, text="", font=("Consolas", 11))
-        self._status_label.grid(row=1, column=1, columnspan=6, padx=6, pady=(0, 6), sticky="w")
+        self._status_label.grid(row=1, column=1, columnspan=7, padx=6, pady=(0, 6), sticky="w")
 
     # ==================================================================
     # Helpers
@@ -532,6 +542,7 @@ class App(ctk.CTk):
         self.min_gpu_ram_var.set(cfg.get("min_gpu_ram", "8"))
         self.max_price_var.set(cfg.get("max_price", "1.0"))
         self.max_samples_var.set(str(cfg.get("max_samples_per_class", 0)))
+        self._on_task_type_changed(self.task_type_var.get())
         self._on_use_builtin_toggled()
 
     def _save_user_config(self) -> None:
@@ -671,7 +682,7 @@ class App(ctk.CTk):
         except ValueError:
             return "Seed must be an integer."
         test_path = self.test_data_path_var.get().strip()
-        if test_path and not pre_split and not os.path.isdir(test_path):
+        if self.task_type_var.get() == "Regression" and test_path and not pre_split and not os.path.isdir(test_path):
             return f"Test Data folder not found: {test_path}"
         if not self.output_path_var.get().strip():
             return "Output Path is required."
@@ -713,6 +724,7 @@ class App(ctk.CTk):
         self.btn_cancel.configure(state="normal")
         self.btn_destroy.configure(state="disabled")
         self.btn_ssh_console.configure(state="disabled")
+        self.btn_download.configure(state="disabled")
 
         self._worker_thread = threading.Thread(target=self._run_pipeline, daemon=True)
         self._worker_thread.start()
@@ -736,10 +748,12 @@ class App(ctk.CTk):
             if self._orchestrator.ssh and self._orchestrator.ssh.is_connected:
                 self.btn_ssh_console.configure(state="normal")
                 self.btn_files.configure(state="normal")
+                self.btn_download.configure(state="normal")
         elif self._orchestrator and self._orchestrator._attached:
             if self._orchestrator.ssh and self._orchestrator.ssh.is_connected:
                 self.btn_ssh_console.configure(state="normal")
                 self.btn_files.configure(state="normal")
+                self.btn_download.configure(state="normal")
 
     def _on_cancel(self) -> None:
         if self._orchestrator:
@@ -759,6 +773,7 @@ class App(ctk.CTk):
         self._orchestrator.destroy_instance()
         self.after(0, lambda: self.btn_destroy.configure(state="disabled"))
         self.after(0, lambda: self.btn_ssh_console.configure(state="disabled"))
+        self.after(0, lambda: self.btn_download.configure(state="disabled"))
 
     # ==================================================================
     # Attach to Existing Instance
@@ -851,6 +866,7 @@ class App(ctk.CTk):
                 self.btn_start.configure(text="▶  Start Training", state="normal")
                 self.btn_ssh_console.configure(state="normal")
                 self.btn_files.configure(state="normal")
+                self.btn_download.configure(state="normal")
                 self.btn_cancel.configure(state="normal")
                 if self._orchestrator.instance_id:
                     self.btn_destroy.configure(state="normal")
@@ -884,6 +900,26 @@ class App(ctk.CTk):
 
         self._worker_thread = threading.Thread(target=_run, daemon=True)
         self._worker_thread.start()
+
+    def _on_download_results(self) -> None:
+        """Download /workspace/output from the active SSH session."""
+        if not self._orchestrator or not self._orchestrator.ssh or not self._orchestrator.ssh.is_connected:
+            self._append_log("⚠  No active SSH connection for result download.")
+            return
+
+        cfg = self._build_config()
+        self._orchestrator.config = cfg
+        self.btn_download.configure(state="disabled")
+
+        def _do():
+            try:
+                self._orchestrator.download_results()
+            except Exception as exc:
+                self._append_log(f"⚠  Download failed: {exc}")
+            finally:
+                self.after(0, lambda: self.btn_download.configure(state="normal"))
+
+        threading.Thread(target=_do, daemon=True).start()
 
     # ==================================================================
     # Remote File Browser
@@ -1110,9 +1146,18 @@ class App(ctk.CTk):
     def _ssh_exec_command(self, cmd: str) -> None:
         """Run a command via SSH and stream output to log."""
         try:
-            self._orchestrator.ssh.exec_command(cmd, log_cb=self._append_log)
+            rc = self._orchestrator.ssh.exec_command(cmd, log_cb=self._append_log)
+            if rc == 0 and self._looks_like_training_command(cmd):
+                self._append_log("Training command finished — downloading /workspace/output automatically…")
+                self._orchestrator.config = self._build_config()
+                self._orchestrator.download_results()
         except Exception as exc:
             self._append_log(f"⚠  SSH error: {exc}")
+
+    @staticmethod
+    def _looks_like_training_command(cmd: str) -> bool:
+        lowered = cmd.lower()
+        return "train.py" in lowered and "python" in lowered
 
     def _on_ssh_exit(self) -> None:
         """Close the SSH console bar."""

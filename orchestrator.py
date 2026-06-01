@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
 from config import ExperimentConfig
@@ -33,33 +34,308 @@ _REMOTE_DEPS = (
     "grad-cam pillow tqdm pandas openpyxl"
 )
 
-# Subsample remote dataset to N images per class (0 = disabled)
-_SUBSAMPLE_SCRIPT_TEMPLATE = r'''
-import os, random
-data_dir = "/workspace/data"
-max_per_class = {max_n}
-seed = {seed}
-if max_per_class <= 0:
-    print("Subsampling disabled.")
-    exit(0)
+_PRE_SPLIT_VALIDATE_SCRIPT = r'''
+import os, re, shutil, sys
+
+root = "/workspace/data"
 exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
-for cls in sorted(os.listdir(data_dir)):
-    cls_path = os.path.join(data_dir, cls)
-    if not os.path.isdir(cls_path):
-        continue
-    files = [f for f in os.listdir(cls_path) if f.lower().endswith(exts)]
-    if len(files) <= max_per_class:
-        print(f"  {{cls}}: {{len(files)}} images — keeping all")
-        continue
-    random.seed(seed)
-    to_keep = set(random.sample(files, max_per_class))
-    removed = 0
-    for f in files:
-        if f not in to_keep:
-            os.remove(os.path.join(cls_path, f))
-            removed += 1
-    print(f"  {{cls}}: kept {{max_per_class}}/{{len(files)}} (removed {{removed}})")
-print("Subsampling done.")
+
+def resolve_split(names):
+    for name in names:
+        path = os.path.join(root, name)
+        if os.path.isdir(path):
+            return name, path
+    print(f"ERROR: Missing split folder. Expected one of: {names}")
+    sys.exit(1)
+
+def organize(data_dir):
+    subdirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
+    if subdirs:
+        has_images = any(
+            any(f.lower().endswith(exts) for f in os.listdir(os.path.join(data_dir, sd)))
+            for sd in subdirs
+        )
+        if has_images:
+            return
+    files = [f for f in os.listdir(data_dir)
+             if os.path.isfile(os.path.join(data_dir, f)) and f.lower().endswith(exts)]
+    if not files:
+        print(f"ERROR: No image files found in {data_dir}")
+        sys.exit(1)
+    classes = {}
+    for filename in files:
+        name = os.path.splitext(filename)[0]
+        match = re.match(r'^([A-Za-z]+)', name)
+        label = match.group(1).upper() if match else "UNKNOWN"
+        classes.setdefault(label, []).append(filename)
+    for label, filenames in classes.items():
+        class_dir = os.path.join(data_dir, label)
+        os.makedirs(class_dir, exist_ok=True)
+        for filename in filenames:
+            shutil.move(os.path.join(data_dir, filename), os.path.join(class_dir, filename))
+
+def count_by_class(data_dir):
+    counts = {}
+    for cls in sorted(os.listdir(data_dir)):
+        cls_path = os.path.join(data_dir, cls)
+        if not os.path.isdir(cls_path):
+            continue
+        count = sum(1 for f in os.listdir(cls_path) if f.lower().endswith(exts))
+        if count > 0:
+            counts[cls] = count
+    return counts
+
+split_dirs = {
+    "train": resolve_split(("train",))[1],
+    "val": resolve_split(("val", "validation"))[1],
+    "test": resolve_split(("test",))[1],
+}
+for split_dir in split_dirs.values():
+    organize(split_dir)
+
+counts = {name: count_by_class(path) for name, path in split_dirs.items()}
+classes = {name: sorted(values) for name, values in counts.items()}
+if not classes["train"]:
+    print("ERROR: No class folders found in train split.")
+    sys.exit(1)
+if classes["train"] != classes["val"] or classes["train"] != classes["test"]:
+    print(f"ERROR: Class folders differ: {classes}")
+    sys.exit(1)
+
+total = sum(sum(values.values()) for values in counts.values())
+for split_name in ("train", "val", "test"):
+    split_total = sum(counts[split_name].values())
+    pct = (split_total / total * 100.0) if total else 0.0
+    print(f"{split_name}: {split_total}/{total} images ({pct:.2f}%) per class {counts[split_name]}")
+print(f"Pre-split dataset OK. Classes: {classes['train']}")
+'''
+
+_AUTO_SPLIT_CLASSIFICATION_SCRIPT = r'''
+import math, os, random, re, shutil, sys
+
+root = "/workspace/data"
+tmp_root = "/workspace/data_split_tmp"
+seed = __SEED__
+ratios = {
+    "train": __TRAIN_RATIO__,
+    "val": __VAL_RATIO__,
+    "test": __TEST_RATIO__,
+}
+split_names = ("train", "val", "test")
+split_aliases = {"train", "val", "validation", "test"}
+exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+
+def image_files(path):
+    return sorted(
+        f for f in os.listdir(path)
+        if os.path.isfile(os.path.join(path, f)) and f.lower().endswith(exts)
+    )
+
+def organize_flat_files():
+    files = image_files(root)
+    if not files:
+        return
+    classes = {}
+    for filename in files:
+        name = os.path.splitext(filename)[0]
+        match = re.match(r'^([A-Za-z]+)', name)
+        label = match.group(1).upper() if match else "UNKNOWN"
+        classes.setdefault(label, []).append(filename)
+    print(f"Detected flat files; organizing into class folders: {dict((k, len(v)) for k, v in classes.items())}")
+    for label, filenames in classes.items():
+        class_dir = os.path.join(root, label)
+        os.makedirs(class_dir, exist_ok=True)
+        for filename in filenames:
+            shutil.move(os.path.join(root, filename), os.path.join(class_dir, filename))
+
+def split_counts(total):
+    ratio_sum = sum(ratios.values())
+    if ratio_sum <= 0:
+        print("ERROR: Split ratios must sum to a positive value.")
+        sys.exit(1)
+    normalized = [ratios[name] / ratio_sum for name in split_names]
+    positive = [i for i, ratio in enumerate(normalized) if ratio > 0]
+    if total < len(positive):
+        print(f"ERROR: Class has only {total} images, but {len(positive)} non-empty splits are requested.")
+        sys.exit(1)
+    raw = [total * ratio for ratio in normalized]
+    counts = [math.floor(value) for value in raw]
+    remainder = total - sum(counts)
+    order = sorted(range(len(raw)), key=lambda i: (raw[i] - counts[i], normalized[i]), reverse=True)
+    for i in order[:remainder]:
+        counts[i] += 1
+    if total >= len(positive):
+        for i in positive:
+            if counts[i] == 0:
+                donors = [j for j in positive if counts[j] > 1]
+                if not donors:
+                    print("ERROR: Cannot keep all requested splits non-empty.")
+                    sys.exit(1)
+                donor = max(donors, key=lambda j: counts[j])
+                counts[donor] -= 1
+                counts[i] += 1
+    return dict(zip(split_names, counts))
+
+def split_totals(class_split_counts):
+    return {
+        split_name: sum(counts[split_name] for counts in class_split_counts.values())
+        for split_name in split_names
+    }
+
+def min_count_for(class_size, split_name):
+    positive_split_count = sum(1 for name in split_names if ratios[name] > 0)
+    if ratios[split_name] > 0 and class_size >= positive_split_count:
+        return 1
+    return 0
+
+def rebalance_to_global_targets(class_split_counts, class_sizes, target_totals):
+    current = split_totals(class_split_counts)
+    guard = 0
+    while current != target_totals:
+        guard += 1
+        if guard > 100000:
+            print("ERROR: Split rebalancing did not converge.")
+            sys.exit(1)
+        moved = False
+        surplus_splits = [name for name in split_names if current[name] > target_totals[name]]
+        deficit_splits = [name for name in split_names if current[name] < target_totals[name]]
+        if not surplus_splits or not deficit_splits:
+            break
+        for src_split in surplus_splits:
+            while current[src_split] > target_totals[src_split]:
+                deficit_splits = [name for name in split_names if current[name] < target_totals[name]]
+                if not deficit_splits:
+                    break
+                dst_split = max(deficit_splits, key=lambda name: target_totals[name] - current[name])
+                donors = [
+                    cls for cls, counts in class_split_counts.items()
+                    if counts[src_split] > min_count_for(class_sizes[cls], src_split)
+                ]
+                if not donors:
+                    break
+                cls = max(
+                    donors,
+                    key=lambda name: class_split_counts[name][src_split] - min_count_for(class_sizes[name], src_split),
+                )
+                class_split_counts[cls][src_split] -= 1
+                class_split_counts[cls][dst_split] += 1
+                current[src_split] -= 1
+                current[dst_split] += 1
+                moved = True
+        if not moved:
+            print(f"ERROR: Cannot rebalance split counts from {current} to requested {target_totals}.")
+            print("Try adding more images per class or using less extreme split ratios.")
+            sys.exit(1)
+
+def validate_split_dirs(expected_totals=None):
+    counts = {}
+    classes = None
+    total = 0
+    for split_name in split_names:
+        split_dir = os.path.join(root, split_name)
+        if not os.path.isdir(split_dir):
+            print(f"ERROR: Missing generated split folder: {split_dir}")
+            sys.exit(1)
+        split_counts_by_class = {}
+        for cls in sorted(os.listdir(split_dir)):
+            cls_path = os.path.join(split_dir, cls)
+            if not os.path.isdir(cls_path):
+                continue
+            count = len(image_files(cls_path))
+            if count > 0:
+                split_counts_by_class[cls] = count
+        if not split_counts_by_class:
+            print(f"ERROR: Split {split_name} is empty.")
+            sys.exit(1)
+        split_classes = sorted(split_counts_by_class)
+        if classes is None:
+            classes = split_classes
+        elif classes != split_classes:
+            print(f"ERROR: Class folders differ in {split_name}: expected {classes}, got {split_classes}")
+            sys.exit(1)
+        counts[split_name] = split_counts_by_class
+        total += sum(split_counts_by_class.values())
+    ratio_sum = sum(ratios.values())
+    for split_name in split_names:
+        split_total = sum(counts[split_name].values())
+        if expected_totals and split_total != expected_totals[split_name]:
+            print(f"ERROR: {split_name} has {split_total} images, expected {expected_totals[split_name]}.")
+            sys.exit(1)
+        actual_pct = split_total / total * 100.0
+        requested_pct = ratios[split_name] / ratio_sum * 100.0
+        print(f"{split_name}: {split_total}/{total} images ({actual_pct:.2f}%, requested {requested_pct:.2f}%) per class {counts[split_name]}")
+    return counts
+
+existing_splits = [name for name in split_names if os.path.isdir(os.path.join(root, name))]
+if existing_splits:
+    print("Dataset already contains split folders on remote; validating existing split.")
+    validate_split_dirs()
+    sys.exit(0)
+
+organize_flat_files()
+class_dirs = [
+    d for d in sorted(os.listdir(root))
+    if os.path.isdir(os.path.join(root, d)) and d not in split_aliases
+]
+if not class_dirs:
+    print("ERROR: No class folders found. Expected folders like NORMAL/ and PNEUMONIA/.")
+    sys.exit(1)
+
+class_files = {}
+for cls in class_dirs:
+    files = image_files(os.path.join(root, cls))
+    if not files:
+        print(f"ERROR: Class folder {cls} has no supported image files.")
+        sys.exit(1)
+    class_files[cls] = files
+
+total_images = sum(len(files) for files in class_files.values())
+target_totals = split_counts(total_images)
+for split_name in split_names:
+    if ratios[split_name] > 0 and target_totals[split_name] < len(class_dirs):
+        print(
+            f"ERROR: Requested {split_name} ratio gives only {target_totals[split_name]} images, "
+            f"but {len(class_dirs)} classes must be represented."
+        )
+        print("Add more images or increase this split ratio.")
+        sys.exit(1)
+
+class_sizes = {cls: len(files) for cls, files in class_files.items()}
+class_split_counts = {cls: split_counts(len(files)) for cls, files in class_files.items()}
+rebalance_to_global_targets(class_split_counts, class_sizes, target_totals)
+
+shutil.rmtree(tmp_root, ignore_errors=True)
+for split_name in split_names:
+    os.makedirs(os.path.join(tmp_root, split_name), exist_ok=True)
+
+for cls in class_dirs:
+    src_dir = os.path.join(root, cls)
+    files = class_files[cls]
+    rng = random.Random(f"{seed}:{cls}")
+    rng.shuffle(files)
+    counts = class_split_counts[cls]
+    print(f"{cls}: splitting {len(files)} images -> {counts}")
+    offset = 0
+    for split_name in split_names:
+        count = counts[split_name]
+        dest_dir = os.path.join(tmp_root, split_name, cls)
+        os.makedirs(dest_dir, exist_ok=True)
+        for filename in files[offset:offset + count]:
+            shutil.move(os.path.join(src_dir, filename), os.path.join(dest_dir, filename))
+        offset += count
+
+for entry in os.listdir(root):
+    path = os.path.join(root, entry)
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+for split_name in split_names:
+    shutil.move(os.path.join(tmp_root, split_name), os.path.join(root, split_name))
+shutil.rmtree(tmp_root, ignore_errors=True)
+
+validate_split_dirs(target_totals)
+print("Auto split dataset OK.")
 '''
 
 # CUDA fixup for newer GPUs (RTX 5000-series / Blackwell)
@@ -234,6 +510,8 @@ class Orchestrator:
                     self.log_cb("[4/6] Dataset already present — skipping upload.")
                     # Still re-upload train.py (could have been modified)
                     self._upload_train_script()
+                    if self.config.task_type == "classification":
+                        self._prepare_remote_classification_data()
                 else:
                     self._step_upload_data()
             if self._cancelled():
@@ -297,6 +575,37 @@ class Orchestrator:
             if os.path.isfile(train_script):
                 self.log_cb("Re-uploading train.py…")
                 self.ssh.upload_file(train_script, "/workspace/train.py")
+
+    def _prepare_remote_classification_data(self) -> None:
+        """Validate or create the remote train/val/test folder split."""
+        if self.config.pre_split_data:
+            self.log_cb("Validating pre-split train/val/test dataset…")
+            rc = self.ssh.exec_command(
+                f"python3 -c {self._shell_quote(_PRE_SPLIT_VALIDATE_SCRIPT)}",
+                log_cb=self.log_cb,
+            )
+            if rc != 0:
+                raise SSHError("Failed to validate pre-split dataset.")
+            return
+
+        self.log_cb(
+            "Splitting uploaded class folders into train/val/test "
+            f"({self.config.train_split:.2f}/{self.config.val_split:.2f}/{self.config.test_split:.2f})…"
+        )
+        split_script = (
+            _AUTO_SPLIT_CLASSIFICATION_SCRIPT
+            .replace("__SEED__", repr(int(self.config.seed)))
+            .replace("__TRAIN_RATIO__", repr(float(self.config.train_split)))
+            .replace("__VAL_RATIO__", repr(float(self.config.val_split)))
+            .replace("__TEST_RATIO__", repr(float(self.config.test_split)))
+        )
+        rc = self.ssh.exec_command(
+            f"python3 -c {self._shell_quote(split_script)}",
+            log_cb=self.log_cb,
+        )
+        if rc != 0:
+            raise SSHError("Failed to split dataset into train/val/test folders.")
+        self.config.pre_split_data = True
 
     def _cancelled(self) -> bool:
         if self._cancel.is_set():
@@ -411,10 +720,23 @@ class Orchestrator:
         )
         if rc_cuda != 0:
             raise SSHError("CUDA fix script failed — cannot continue.")
+        # Re-install grad-cam AFTER the CUDA fix so it links against the
+        # correct torch build (the fix may have replaced torch/torchvision).
+        rc_gc = self.ssh.exec_command(
+            "pip install --quiet --no-deps --force-reinstall grad-cam",
+            log_cb=self.log_cb,
+        )
+        if rc_gc != 0:
+            self.log_cb("WARNING: grad-cam reinstall failed — Grad-CAM may not work.")
 
     def _step_upload_data(self) -> None:
         self.log_cb("=" * 60)
         self.log_cb("[4/6] Uploading dataset…")
+        self.ssh.exec_command(
+            "rm -rf /workspace/data /workspace/test_data && "
+            "mkdir -p /workspace/data /workspace/test_data /workspace/output",
+            log_cb=self.log_cb,
+        )
 
         # ── Local subsampling: build a temp folder with only N files/class ──
         upload_path = self.config.data_path
@@ -453,157 +775,8 @@ class Orchestrator:
                 self.log_cb("Uploading train.py…")
                 self.ssh.upload_file(train_script, "/workspace/train.py")
 
-        # Auto-organize flat image folder (classification only)
         if self.config.task_type == "classification":
-            self.log_cb("Organizing dataset into class folders…")
-            organize_script = r'''
-import os, re, shutil
-data_dir = "/workspace/data"
-subdirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
-if subdirs:
-    has_images = any(
-        any(f.lower().endswith(('.png','.jpg','.jpeg','.bmp','.tif','.tiff'))
-            for f in os.listdir(os.path.join(data_dir, sd)))
-        for sd in subdirs
-    )
-    if has_images:
-        print(f"Already organized: {subdirs}")
-        exit(0)
-files = [f for f in os.listdir(data_dir)
-         if os.path.isfile(os.path.join(data_dir, f))
-         and f.lower().endswith(('.png','.jpg','.jpeg','.bmp','.tif','.tiff'))]
-if not files:
-    print("ERROR: No image files found in data directory!")
-    exit(1)
-classes = {}
-for f in files:
-    name = os.path.splitext(f)[0]
-    match = re.match(r'^([A-Za-z]+)', name)
-    label = match.group(1).upper() if match else "UNKNOWN"
-    classes.setdefault(label, []).append(f)
-print(f"Detected {len(classes)} classes: {dict((k, len(v)) for k, v in classes.items())}")
-for label, flist in classes.items():
-    class_dir = os.path.join(data_dir, label)
-    os.makedirs(class_dir, exist_ok=True)
-    for f in flist:
-        shutil.move(os.path.join(data_dir, f), os.path.join(class_dir, f))
-print("Dataset organized successfully.")
-'''
-            if self.config.pre_split_data:
-                self.log_cb("Validating pre-split train/val/test dataset…")
-                pre_split_script = r'''
-import os, re, shutil, sys
-root = "/workspace/data"
-exts = ('.png','.jpg','.jpeg','.bmp','.tif','.tiff')
-
-def resolve_split(names):
-    for name in names:
-        path = os.path.join(root, name)
-        if os.path.isdir(path):
-            return name, path
-    print(f"ERROR: Missing split folder. Expected one of: {names}")
-    sys.exit(1)
-
-def organize(data_dir):
-    subdirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
-    if subdirs:
-        has_images = any(
-            any(f.lower().endswith(exts) for f in os.listdir(os.path.join(data_dir, sd)))
-            for sd in subdirs
-        )
-        if has_images:
-            print(f"{os.path.basename(data_dir)} already organized: {subdirs}")
-            return
-    files = [f for f in os.listdir(data_dir)
-             if os.path.isfile(os.path.join(data_dir, f)) and f.lower().endswith(exts)]
-    if not files:
-        print(f"ERROR: No image files found in {data_dir}")
-        sys.exit(1)
-    classes = {}
-    for filename in files:
-        name = os.path.splitext(filename)[0]
-        match = re.match(r'^([A-Za-z]+)', name)
-        label = match.group(1).upper() if match else "UNKNOWN"
-        classes.setdefault(label, []).append(filename)
-    for label, filenames in classes.items():
-        class_dir = os.path.join(data_dir, label)
-        os.makedirs(class_dir, exist_ok=True)
-        for filename in filenames:
-            shutil.move(os.path.join(data_dir, filename), os.path.join(class_dir, filename))
-    print(f"{os.path.basename(data_dir)} organized: {dict((k, len(v)) for k, v in classes.items())}")
-
-def class_names(data_dir):
-    return sorted(d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)))
-
-_, train_dir = resolve_split(("train",))
-_, val_dir = resolve_split(("val", "validation"))
-_, test_dir = resolve_split(("test",))
-for split_dir in (train_dir, val_dir, test_dir):
-    organize(split_dir)
-train_classes = class_names(train_dir)
-val_classes = class_names(val_dir)
-test_classes = class_names(test_dir)
-if not train_classes:
-    print("ERROR: No class folders found in train split.")
-    sys.exit(1)
-if train_classes != val_classes or train_classes != test_classes:
-    print(f"ERROR: Class folders differ: train={train_classes}, val={val_classes}, test={test_classes}")
-    sys.exit(1)
-print(f"Pre-split dataset OK. Classes: {train_classes}")
-'''
-                rc = self.ssh.exec_command(
-                    f"python3 -c {self._shell_quote(pre_split_script)}",
-                    log_cb=self.log_cb,
-                )
-                if rc != 0:
-                    raise SSHError("Failed to validate pre-split dataset.")
-            else:
-                rc = self.ssh.exec_command(
-                    f"python3 -c {self._shell_quote(organize_script)}",
-                    log_cb=self.log_cb,
-                )
-                if rc != 0:
-                    raise SSHError("Failed to organize dataset into class folders.")
-
-                # Subsample training set to N images per class
-                if self.config.max_samples_per_class > 0:
-                    self.log_cb(
-                        f"Subsampling training data to "
-                        f"{self.config.max_samples_per_class} images/class…"
-                    )
-                    sub_script = _SUBSAMPLE_SCRIPT_TEMPLATE.format(
-                        max_n=self.config.max_samples_per_class,
-                        seed=self.config.seed,
-                    )
-                    rc_sub = self.ssh.exec_command(
-                        f"python3 -c {self._shell_quote(sub_script)}",
-                        log_cb=self.log_cb,
-                    )
-                    if rc_sub != 0:
-                        raise SSHError("Subsampling step failed.")
-
-                # Upload separate test data if provided
-                if self.config.test_data_path and os.path.isdir(self.config.test_data_path):
-                    self.log_cb("Uploading separate test dataset…")
-                    if not self.ssh.upload_rsync(
-                        self.config.test_data_path, "/workspace/test_data", log_cb=self.log_cb,
-                    ):
-                        self.ssh.upload_directory(
-                            local_path=self.config.test_data_path,
-                            remote_path="/workspace/test_data",
-                            log_cb=self.log_cb,
-                        )
-                    self.log_cb("Organizing test dataset into class folders…")
-                    organize_test = organize_script.replace(
-                        'data_dir = "/workspace/data"',
-                        'data_dir = "/workspace/test_data"',
-                    )
-                    rc2 = self.ssh.exec_command(
-                        f"python3 -c {self._shell_quote(organize_test)}",
-                        log_cb=self.log_cb,
-                    )
-                    if rc2 != 0:
-                        raise SSHError("Failed to organize test dataset into class folders.")
+            self._prepare_remote_classification_data()
         else:
             # Regression — just upload test data if provided (no re-organizing needed)
             if self.config.test_data_path and os.path.isdir(self.config.test_data_path):
@@ -702,6 +875,18 @@ print(f"Pre-split dataset OK. Classes: {train_classes}")
     def _step_download_results(self) -> None:
         self.log_cb("=" * 60)
         self.log_cb("[6/6] Downloading results (Harvest)…")
+        self.log_cb(f"Local output path: {self.config.output_path}")
+
+        remote_files = self._remote_output_files()
+        if remote_files:
+            png_count = sum(1 for item in remote_files if item.lower().endswith(".png"))
+            gradcam_count = sum(1 for item in remote_files if "gradcam" in item.lower() and item.lower().endswith(".png"))
+            self.log_cb(
+                f"Remote output contains {len(remote_files)} files "
+                f"({png_count} PNG, {gradcam_count} Grad-CAM)."
+            )
+        else:
+            self.log_cb("WARNING: /workspace/output is empty or could not be scanned before download.")
 
         # Try rsync first, then tar/SFTP fallback
         if not self.ssh.download_rsync(
@@ -712,6 +897,50 @@ print(f"Pre-split dataset OK. Classes: {train_classes}")
                 local_path=self.config.output_path,
                 log_cb=self.log_cb,
             )
+        self._log_local_output_summary()
+
+    def download_results(self) -> None:
+        """Public wrapper used by the GUI to download current remote results."""
+        if not self.ssh or not self.ssh.is_connected:
+            raise SSHError("No active SSH connection for result download.")
+        self._step_download_results()
+
+    def _remote_output_files(self) -> list[str]:
+        """Return relative file paths currently present in /workspace/output."""
+        try:
+            tree = self.ssh.get_remote_file_structure("/workspace/output", max_depth=3)
+        except Exception as exc:
+            self.log_cb(f"WARNING: remote output scan failed: {exc}")
+            return []
+
+        files: list[str] = []
+
+        def collect(nodes: list) -> None:
+            for node in nodes:
+                if node.get("is_dir"):
+                    collect(node.get("children", []))
+                else:
+                    files.append(str(node.get("path", "")).replace("/workspace/output/", "", 1))
+
+        collect(tree)
+        return sorted(item for item in files if item)
+
+    def _log_local_output_summary(self) -> None:
+        local = Path(self.config.output_path)
+        if not local.exists():
+            self.log_cb(f"WARNING: local output path was not created: {local}")
+            return
+
+        files = [p for p in local.rglob("*") if p.is_file()]
+        pngs = [p for p in files if p.suffix.lower() == ".png"]
+        gradcams = [p for p in pngs if "gradcam" in p.name.lower()]
+        self.log_cb(
+            f"Local output now has {len(files)} files "
+            f"({len(pngs)} PNG, {len(gradcams)} Grad-CAM)."
+        )
+        if pngs:
+            preview = ", ".join(p.name for p in sorted(pngs)[:8])
+            self.log_cb(f"Downloaded PNGs: {preview}")
 
     # ------------------------------------------------------------------
     # Instance destruction
