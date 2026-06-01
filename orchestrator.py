@@ -136,15 +136,27 @@ def image_files(path):
         if os.path.isfile(os.path.join(path, f)) and f.lower().endswith(exts)
     )
 
+def target_class_name(cls, source_path):
+    text = f"{cls}/{os.path.basename(source_path)}".lower()
+    if "bacteria" in text or "bacterial" in text:
+        return "PNEUMONIA_BACTERIAL"
+    if "virus" in text or "viral" in text:
+        return "PNEUMONIA_VIRUS"
+    if "normal" in text:
+        return "NORMAL"
+    return cls
+
 def organize_flat_files():
     files = image_files(root)
     if not files:
         return
     classes = {}
     for filename in files:
-        name = os.path.splitext(filename)[0]
-        match = re.match(r'^([A-Za-z]+)', name)
-        label = match.group(1).upper() if match else "UNKNOWN"
+        label = target_class_name("UNKNOWN", filename)
+        if label == "UNKNOWN":
+            name = os.path.splitext(filename)[0]
+            match = re.match(r'^([A-Za-z]+)', name)
+            label = match.group(1).upper() if match else "UNKNOWN"
         classes.setdefault(label, []).append(filename)
     print(f"Detected flat files; organizing into class folders: {dict((k, len(v)) for k, v in classes.items())}")
     for label, filenames in classes.items():
@@ -177,8 +189,8 @@ def collect_class_files():
                 if not os.path.isdir(cls_dir):
                     continue
                 files = [os.path.join(cls_dir, filename) for filename in image_files(cls_dir)]
-                if files:
-                    class_files.setdefault(cls, []).extend(files)
+                for source_path in files:
+                    class_files.setdefault(target_class_name(cls, source_path), []).append(source_path)
         return class_files
 
     organize_flat_files()
@@ -190,8 +202,8 @@ def collect_class_files():
     for cls in class_dirs:
         cls_dir = os.path.join(root, cls)
         files = [os.path.join(cls_dir, filename) for filename in image_files(cls_dir)]
-        if files:
-            class_files[cls] = files
+        for source_path in files:
+            class_files.setdefault(target_class_name(cls, source_path), []).append(source_path)
     return class_files
 
 def group_key(cls, source_path):
@@ -201,6 +213,9 @@ def group_key(cls, source_path):
     if match:
         return f"{cls}:{match.group(1).lower()}"
     match = re.search(r'(NORMAL2-IM-\d+|IM-\d+)', stem, re.I)
+    if match:
+        return f"{cls}:{match.group(1).lower()}"
+    match = re.search(r'((?:BACTERIA|VIRUS)-\d+)', stem, re.I)
     if match:
         return f"{cls}:{match.group(1).lower()}"
     return f"{cls}:{stem.lower()}"
