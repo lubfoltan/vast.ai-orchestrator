@@ -68,7 +68,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr",         type=float, help="Learning rate")
     p.add_argument("--batch-size", type=int,   help="Batch size")
     p.add_argument("--model",      type=str,
-                   choices=["ResNet-50", "DenseNet-121", "EfficientNet-B0", "ConvNeXt"],
+                   choices=["ResNet-50", "DenseNet-121", "EfficientNet-B0", "ConvNeXt", "Custom CNN"],
                    help="Model architecture")
 
     p.add_argument("--data-path",   type=str, help="Override data_path")
@@ -131,6 +131,7 @@ def _build_experiment_config(cfg: dict):
         "DenseNet-121":   "densenet121",
         "EfficientNet-B0": "efficientnet_b0",
         "ConvNeXt":       "convnext",
+        "Custom CNN":     "custom_cnn",
     }
 
     ec = ExperimentConfig()

@@ -10,7 +10,7 @@ from PIL import Image
 # ==========================================
 
 INPUT_FOLDER = r"C:\Skola\4 letny semester\HSU\data"  # Replace with your input folder path
-OUTPUT_FOLDER = r"C:\Skola\4 letny semester\HSU\224x224_3class_preprocessed_images" # Replace with your output folder path
+OUTPUT_FOLDER = r"C:\Skola\4 letny semester\HSU\224x224_pre" # Replace with your output folder path
 
 TARGET_WIDTH = 224  # Set the desired width
 TARGET_HEIGHT = 224 # Set the desired height

@@ -139,9 +139,13 @@ class App(ctk.CTk):
 
         row += 1
         # ── Paths ──
-        ctk.CTkLabel(f, text="Train Data:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
+        self._data_label = ctk.CTkLabel(f, text="Dataset:")
+        self._data_label.grid(row=row, column=0, padx=5, pady=4, sticky="e")
         self.data_path_var = ctk.StringVar()
-        self._data_entry = ctk.CTkEntry(f, textvariable=self.data_path_var)
+        self._data_entry = ctk.CTkEntry(
+            f, textvariable=self.data_path_var,
+            placeholder_text="Folder with class subfolders (e.g. NORMAL/, PNEUMONIA/)",
+        )
         self._data_entry.grid(row=row, column=1, columnspan=2, padx=5, pady=4, sticky="ew")
         self._data_browse_btn = ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_data)
         self._data_browse_btn.grid(row=row, column=3, padx=2)
@@ -152,13 +156,12 @@ class App(ctk.CTk):
         ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_output).grid(row=row, column=6, padx=2)
 
         row += 1
-        self.test_data_label = ctk.CTkLabel(f, text="Test Data:")
-        self.test_data_label.grid(row=row, column=0, padx=5, pady=4, sticky="e")
+        ctk.CTkLabel(f, text="Test Data:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
         self.test_data_path_var = ctk.StringVar()
         self._test_data_entry = ctk.CTkEntry(
             f,
             textvariable=self.test_data_path_var,
-            placeholder_text="(Regression only; classification uses train/val/test split ratios)",
+            placeholder_text="(Disabled — server splits automatically from ratios)",
         )
         self._test_data_entry.grid(row=row, column=1, columnspan=2, padx=5, pady=4, sticky="ew")
         self._test_data_browse_btn = ctk.CTkButton(f, text="Browse…", width=70, command=self._browse_test_data)
@@ -293,26 +296,6 @@ class App(ctk.CTk):
         )
 
         row += 1
-        # ── Resize (classification only) ──
-        ctk.CTkLabel(f, text="Resize:").grid(row=row, column=0, padx=5, pady=4, sticky="e")
-        self.resize_frame = ctk.CTkFrame(f, fg_color="transparent")
-        self.resize_frame.grid(row=row, column=1, columnspan=6, padx=5, pady=4, sticky="w")
-        self.resize_enabled_var = ctk.BooleanVar(value=True)
-        self.resize_cb = ctk.CTkCheckBox(
-            self.resize_frame, text="Enable", variable=self.resize_enabled_var,
-            command=self._on_resize_toggled,
-        )
-        self.resize_cb.pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(self.resize_frame, text="width").pack(side="left", padx=(0, 2))
-        self.resize_width_var = ctk.StringVar(value="224")
-        self.resize_width_entry = ctk.CTkEntry(self.resize_frame, textvariable=self.resize_width_var, width=60)
-        self.resize_width_entry.pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(self.resize_frame, text="height").pack(side="left", padx=(0, 2))
-        self.resize_height_var = ctk.StringVar(value="224")
-        self.resize_height_entry = ctk.CTkEntry(self.resize_frame, textvariable=self.resize_height_var, width=60)
-        self.resize_height_entry.pack(side="left", padx=(0, 8))
-
-        row += 1
         # ── Augmentation (classification only) ──
         self.aug_label = ctk.CTkLabel(f, text="Augmentation:")
         self.aug_label.grid(row=row, column=0, padx=5, pady=4, sticky="ne")
@@ -384,6 +367,7 @@ class App(ctk.CTk):
             label = m.replace("_", " ").upper() if m in ("mse", "rmse", "mae", "r2", "mape") else m.replace("_", " ").title()
             ctk.CTkCheckBox(self.met_frame, text=label, variable=var).pack(side="left", padx=5)
 
+    # ------------------------------------------------------------------
     def _apply_classification_metric_preset(self) -> None:
         if self.task_type_var.get() != "Classification":
             return
@@ -415,29 +399,32 @@ class App(ctk.CTk):
         """Toggle fields that only apply when SCOUT creates the split."""
         builtin = self.use_builtin_var.get()
         pre_split = self.pre_split_data_var.get()
-        is_regression = self.task_type_var.get() == "Regression"
-        data_state = "disabled" if builtin else "normal"
-        test_state = "normal" if is_regression and not builtin and not pre_split else "disabled"
+        # Test folder only makes sense when data is pre-split (user owns the test set).
+        # When server splits, test data is derived from the main dataset via ratios.
+        test_state = "normal" if (not builtin and pre_split) else "disabled"
         ratio_state = "disabled" if pre_split else "normal"
 
-        self._data_entry.configure(state=data_state)
-        self._data_browse_btn.configure(state=data_state)
-        self.pre_split_data_cb.configure(state=data_state)
         self._test_data_entry.configure(state=test_state)
         self._test_data_browse_btn.configure(state=test_state)
+        if test_state == "disabled":
+            self.test_data_path_var.set("")
         for child in self.ratio_frame.winfo_children():
             try:
                 child.configure(state=ratio_state)
             except Exception:
                 pass
 
-    def _on_resize_toggled(self) -> None:
-        """Enable/disable resize dimension inputs."""
-        is_classification = self.task_type_var.get() == "Classification"
-        state = "normal" if is_classification and self.resize_enabled_var.get() else "disabled"
-        self.resize_cb.configure(state="normal" if is_classification else "disabled")
-        self.resize_width_entry.configure(state=state)
-        self.resize_height_entry.configure(state=state)
+        # Update dataset label to reflect expected folder structure
+        if pre_split:
+            self._data_label.configure(text="Pre-split Root:")
+            self._data_entry.configure(
+                placeholder_text="Folder containing train/, val/, test/ subfolders"
+            )
+        else:
+            self._data_label.configure(text="Dataset:")
+            self._data_entry.configure(
+                placeholder_text="Folder with class subfolders (e.g. NORMAL/, PNEUMONIA/)"
+            )
 
     # ------------------------------------------------------------------
     def _on_task_type_changed(self, choice: str) -> None:
@@ -457,7 +444,6 @@ class App(ctk.CTk):
             self.mixup_cb.configure(state="disabled")
             self.label_smooth_cb.configure(state="disabled")
             self.three_class_cb.configure(state="disabled")
-            self.test_data_label.configure(text="Test Data:")
         else:
             # Hide regression fields
             self.regression_frame.grid_remove()
@@ -468,13 +454,10 @@ class App(ctk.CTk):
             self.mixup_cb.configure(state="normal")
             self.label_smooth_cb.configure(state="normal")
             self.three_class_cb.configure(state="normal" if not self.use_builtin_var.get() else "disabled")
-            self.test_data_label.configure(text="Test Data:")
-        self._on_pre_split_toggled()
-        self._on_resize_toggled()
 
     # ------------------------------------------------------------------
     def _build_buttons(self, parent: ctk.CTkFrame) -> None:
-        parent.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6, 7), weight=1)
+        parent.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6), weight=1)
 
         self.btn_start = ctk.CTkButton(parent, text="▶  Start Pipeline", command=self._on_start, fg_color="green")
         self.btn_start.grid(row=0, column=0, padx=6, pady=8, sticky="ew")
@@ -502,23 +485,18 @@ class App(ctk.CTk):
         )
         self.btn_files.grid(row=0, column=5, padx=6, pady=8, sticky="ew")
 
-        self.btn_download = ctk.CTkButton(
-            parent, text="⬇  Download Results", command=self._on_download_results, state="disabled"
-        )
-        self.btn_download.grid(row=0, column=6, padx=6, pady=8, sticky="ew")
-
         self.btn_chart = ctk.CTkButton(
             parent, text="📈  Live Chart", command=self._on_toggle_chart,
             state="normal" if _HAS_MATPLOTLIB else "disabled"
         )
-        self.btn_chart.grid(row=0, column=7, padx=6, pady=8, sticky="ew")
+        self.btn_chart.grid(row=0, column=6, padx=6, pady=8, sticky="ew")
 
         self.btn_clear = ctk.CTkButton(parent, text="Clear Log", command=self._clear_log, fg_color="gray")
         self.btn_clear.grid(row=1, column=0, padx=6, pady=(0, 6), sticky="ew")
 
         # Status label for attach mode
         self._status_label = ctk.CTkLabel(parent, text="", font=("Consolas", 11))
-        self._status_label.grid(row=1, column=1, columnspan=7, padx=6, pady=(0, 6), sticky="w")
+        self._status_label.grid(row=1, column=1, columnspan=6, padx=6, pady=(0, 6), sticky="w")
 
     # ==================================================================
     # Helpers
@@ -585,7 +563,14 @@ class App(ctk.CTk):
         self.api_key_var.set(cfg.get("api_key", ""))
         self.ssh_key_var.set(cfg.get("ssh_key_path", ""))
         self.data_path_var.set(cfg.get("data_path", ""))
-        self.test_data_path_var.set(cfg.get("test_data_path", ""))
+        # Only restore test_data_path when pre_split is True AND the folder still exists.
+        # In server-split mode (pre_split=False), test data comes from ratios — no local folder needed.
+        _saved_test = cfg.get("test_data_path", "")
+        _saved_pre_split = bool(cfg.get("pre_split_data", False))
+        if _saved_pre_split and _saved_test and os.path.isdir(_saved_test):
+            self.test_data_path_var.set(_saved_test)
+        else:
+            self.test_data_path_var.set("")
         self.output_path_var.set(cfg.get("output_path", ""))
         self.custom_script_var.set(cfg.get("custom_script_path", ""))
         self.task_type_var.set(cfg.get("task_type", "Classification"))
@@ -604,12 +589,7 @@ class App(ctk.CTk):
         self.min_gpu_ram_var.set(cfg.get("min_gpu_ram", "8"))
         self.max_price_var.set(cfg.get("max_price", "1.0"))
         self.max_samples_var.set(str(cfg.get("max_samples_per_class", 0)))
-        self.resize_enabled_var.set(bool(cfg.get("resize_enabled", True)))
-        self.resize_width_var.set(str(cfg.get("resize_width", 224)))
-        self.resize_height_var.set(str(cfg.get("resize_height", 224)))
-        self._on_task_type_changed(self.task_type_var.get())
         self._on_use_builtin_toggled()
-        self._on_resize_toggled()
 
     def _save_user_config(self) -> None:
         """Persist current GUI settings to user_config.json."""
@@ -636,9 +616,6 @@ class App(ctk.CTk):
             "min_gpu_ram": self.min_gpu_ram_var.get(),
             "max_price": self.max_price_var.get(),
             "max_samples_per_class": int(self.max_samples_var.get() or 0),
-            "resize_enabled": self.resize_enabled_var.get(),
-            "resize_width": self.resize_width_var.get(),
-            "resize_height": self.resize_height_var.get(),
         }
         try:
             with open(_USER_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -664,6 +641,8 @@ class App(ctk.CTk):
         cfg.api_key = self.api_key_var.get().strip()
         cfg.ssh_key_path = self.ssh_key_var.get().strip()
         cfg.model_name = ExperimentConfig.MODEL_CHOICES[self.model_var.get()]
+        if cfg.task_type == "classification" and cfg.model_name == "custom_cnn" and not cfg.custom_script_path:
+            cfg.three_class_classification = True
         cfg.optimizer = self.optimizer_var.get()
         try:
             cfg.learning_rate = float(self.lr_var.get())
@@ -694,15 +673,6 @@ class App(ctk.CTk):
         cfg.random_rotation = self.aug_rotation_var.get()
         cfg.horizontal_flip = self.aug_hflip_var.get()
         cfg.random_erasing = self.aug_erasing_var.get()
-        cfg.resize_enabled = self.resize_enabled_var.get()
-        try:
-            cfg.resize_width = int(self.resize_width_var.get())
-        except ValueError:
-            cfg.resize_width = 224
-        try:
-            cfg.resize_height = int(self.resize_height_var.get())
-        except ValueError:
-            cfg.resize_height = 224
         # Features
         cfg.early_stopping = self.early_stop_var.get()
         cfg.early_stopping_patience = self.patience_var.get()
@@ -762,18 +732,10 @@ class App(ctk.CTk):
         except ValueError:
             return "Seed must be an integer."
         test_path = self.test_data_path_var.get().strip()
-        if self.task_type_var.get() == "Regression" and test_path and not pre_split and not os.path.isdir(test_path):
+        if test_path and not pre_split and not os.path.isdir(test_path):
             return f"Test Data folder not found: {test_path}"
         if not self.output_path_var.get().strip():
             return "Output Path is required."
-        if self.task_type_var.get() == "Classification" and self.resize_enabled_var.get():
-            try:
-                resize_width = int(self.resize_width_var.get())
-                resize_height = int(self.resize_height_var.get())
-            except ValueError:
-                return "Resize width and height must be integers."
-            if resize_width <= 0 or resize_height <= 0:
-                return "Resize width and height must be greater than 0, or disable resize."
         ssh_key = self.ssh_key_var.get().strip()
         if not ssh_key:
             return "SSH Key path is required."
@@ -812,7 +774,6 @@ class App(ctk.CTk):
         self.btn_cancel.configure(state="normal")
         self.btn_destroy.configure(state="disabled")
         self.btn_ssh_console.configure(state="disabled")
-        self.btn_download.configure(state="disabled")
 
         self._worker_thread = threading.Thread(target=self._run_pipeline, daemon=True)
         self._worker_thread.start()
@@ -836,12 +797,10 @@ class App(ctk.CTk):
             if self._orchestrator.ssh and self._orchestrator.ssh.is_connected:
                 self.btn_ssh_console.configure(state="normal")
                 self.btn_files.configure(state="normal")
-                self.btn_download.configure(state="normal")
         elif self._orchestrator and self._orchestrator._attached:
             if self._orchestrator.ssh and self._orchestrator.ssh.is_connected:
                 self.btn_ssh_console.configure(state="normal")
                 self.btn_files.configure(state="normal")
-                self.btn_download.configure(state="normal")
 
     def _on_cancel(self) -> None:
         if self._orchestrator:
@@ -861,7 +820,6 @@ class App(ctk.CTk):
         self._orchestrator.destroy_instance()
         self.after(0, lambda: self.btn_destroy.configure(state="disabled"))
         self.after(0, lambda: self.btn_ssh_console.configure(state="disabled"))
-        self.after(0, lambda: self.btn_download.configure(state="disabled"))
 
     # ==================================================================
     # Attach to Existing Instance
@@ -954,7 +912,6 @@ class App(ctk.CTk):
                 self.btn_start.configure(text="▶  Start Training", state="normal")
                 self.btn_ssh_console.configure(state="normal")
                 self.btn_files.configure(state="normal")
-                self.btn_download.configure(state="normal")
                 self.btn_cancel.configure(state="normal")
                 if self._orchestrator.instance_id:
                     self.btn_destroy.configure(state="normal")
@@ -988,26 +945,6 @@ class App(ctk.CTk):
 
         self._worker_thread = threading.Thread(target=_run, daemon=True)
         self._worker_thread.start()
-
-    def _on_download_results(self) -> None:
-        """Download /workspace/output from the active SSH session."""
-        if not self._orchestrator or not self._orchestrator.ssh or not self._orchestrator.ssh.is_connected:
-            self._append_log("⚠  No active SSH connection for result download.")
-            return
-
-        cfg = self._build_config()
-        self._orchestrator.config = cfg
-        self.btn_download.configure(state="disabled")
-
-        def _do():
-            try:
-                self._orchestrator.download_results()
-            except Exception as exc:
-                self._append_log(f"⚠  Download failed: {exc}")
-            finally:
-                self.after(0, lambda: self.btn_download.configure(state="normal"))
-
-        threading.Thread(target=_do, daemon=True).start()
 
     # ==================================================================
     # Remote File Browser
@@ -1234,18 +1171,9 @@ class App(ctk.CTk):
     def _ssh_exec_command(self, cmd: str) -> None:
         """Run a command via SSH and stream output to log."""
         try:
-            rc = self._orchestrator.ssh.exec_command(cmd, log_cb=self._append_log)
-            if rc == 0 and self._looks_like_training_command(cmd):
-                self._append_log("Training command finished — downloading /workspace/output automatically…")
-                self._orchestrator.config = self._build_config()
-                self._orchestrator.download_results()
+            self._orchestrator.ssh.exec_command(cmd, log_cb=self._append_log)
         except Exception as exc:
             self._append_log(f"⚠  SSH error: {exc}")
-
-    @staticmethod
-    def _looks_like_training_command(cmd: str) -> bool:
-        lowered = cmd.lower()
-        return "train.py" in lowered and "python" in lowered
 
     def _on_ssh_exit(self) -> None:
         """Close the SSH console bar."""

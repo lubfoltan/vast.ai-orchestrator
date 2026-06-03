@@ -15,6 +15,7 @@ import csv
 import json
 import os
 import random
+import re
 import sys
 import time
 
@@ -38,9 +39,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="Training Script (Classification / Regression)")
     p.add_argument("--task", type=str, default="classification", choices=["classification", "regression"])
     p.add_argument("--model", type=str, default="resnet50",
-                   choices=["resnet50", "densenet121", "efficientnet_b0", "convnext"])
+                   choices=["resnet50", "densenet121", "efficientnet_b0", "convnext", "custom_cnn"])
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd"])
     p.add_argument("--data_dir", type=str, default="/workspace/data")
@@ -59,9 +61,6 @@ def parse_args():
     p.add_argument("--random_rotation", action="store_true")
     p.add_argument("--horizontal_flip", action="store_true")
     p.add_argument("--random_erasing", action="store_true")
-    p.add_argument("--resize_width", type=int, default=224)
-    p.add_argument("--resize_height", type=int, default=224)
-    p.add_argument("--no_resize", action="store_true")
     # Feature flags
     p.add_argument("--early_stopping", action="store_true")
     p.add_argument("--patience", type=int, default=7)
@@ -90,28 +89,22 @@ def train_classification(args):
 
     requested_metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
     print(f"Metrics: {requested_metrics}")
-    if args.no_resize:
-        print("Resize: disabled")
-    else:
-        print(f"Resize: {args.resize_width}x{args.resize_height}")
 
     train_tfm, val_tfm = _build_cls_transforms(args)
 
     if getattr(args, "use_builtin", False):
         print("[Test Mode] Using built-in CIFAR-100 dataset")
-        cifar_train_steps = _resize_steps(args, transforms)
-        cifar_train_steps += [
+        cifar_train_tfm = transforms.Compose([
+            transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761]),
-        ]
-        cifar_val_steps = _resize_steps(args, transforms)
-        cifar_val_steps += [
+        ])
+        cifar_val_tfm = transforms.Compose([
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761]),
-        ]
-        cifar_train_tfm = transforms.Compose(cifar_train_steps)
-        cifar_val_tfm = transforms.Compose(cifar_val_steps)
+        ])
         train_source_ds = datasets.CIFAR100(root=args.data_dir, train=True, download=True, transform=cifar_train_tfm)
         eval_source_ds = datasets.CIFAR100(root=args.data_dir, train=True, download=True, transform=cifar_val_tfm)
         test_ds = datasets.CIFAR100(root=args.data_dir, train=False, download=True, transform=cifar_val_tfm)
@@ -191,11 +184,12 @@ def train_classification(args):
     loader_generator = torch.Generator()
     loader_generator.manual_seed(args.seed)
     pin_memory = torch.cuda.is_available()
+    num_workers = max(0, int(getattr(args, "num_workers", 2)))
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=pin_memory,
         worker_init_fn=_seed_worker,
         generator=loader_generator,
@@ -204,7 +198,7 @@ def train_classification(args):
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=pin_memory,
         worker_init_fn=_seed_worker,
     )
@@ -212,7 +206,7 @@ def train_classification(args):
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=pin_memory,
         worker_init_fn=_seed_worker,
     )
@@ -333,11 +327,12 @@ def train_classification(args):
         _plot_roc(test_labels, test_probs, class_names, num_classes, args.output_dir)
     if args.grad_cam:
         try:
-            _generate_gradcam(model, test_loader, device, args.output_dir, class_names, num_images=5)
+            _generate_gradcam(
+                model, test_loader, device, args.output_dir, class_names,
+                num_correct=5, num_incorrect=5, seed=args.seed,
+            )
         except Exception as e:
-            import traceback
             print(f"Grad-CAM failed: {e}")
-            traceback.print_exc()
 
     final_metrics = {
         "val_loss": val_loss,
@@ -792,9 +787,42 @@ def _print_summary(metrics_dict, output_dir):
 
 
 # ── Classification helpers ───────────────────────────────────────────
+class CustomChestXrayCNN(nn.Module):
+    def __init__(self, num_classes: int, dropout: float = 0.5) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            self._block(3, 32),
+            self._block(32, 64),
+            self._block(64, 128),
+            self._block(128, 256),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes),
+        )
+
+    @staticmethod
+    def _block(in_channels: int, out_channels: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.pool(x)
+        return self.classifier(x)
+
+
 def _build_cls_transforms(args):
     from torchvision import transforms
-    train_tfms = _resize_steps(args, transforms)
+    train_tfms = [transforms.Resize((224, 224))]
     if args.random_rotation:
         train_tfms.append(transforms.RandomRotation(15))
     if args.horizontal_flip:
@@ -803,18 +831,9 @@ def _build_cls_transforms(args):
                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
     if args.random_erasing:
         train_tfms.append(transforms.RandomErasing())
-    val_tfms = _resize_steps(args, transforms)
-    val_tfms += [transforms.ToTensor(),
-                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
+    val_tfms = [transforms.Resize((224, 224)), transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
     return transforms.Compose(train_tfms), transforms.Compose(val_tfms)
-
-
-def _resize_steps(args, transforms):
-    if getattr(args, "no_resize", False):
-        return []
-    if args.resize_width <= 0 or args.resize_height <= 0:
-        raise ValueError("resize_width and resize_height must be positive integers, or use --no_resize")
-    return [transforms.Resize((args.resize_height, args.resize_width))]
 
 
 def _build_cls_model(name, num_classes):
@@ -831,6 +850,8 @@ def _build_cls_model(name, num_classes):
     elif name == "convnext":
         m = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.DEFAULT)
         m.classifier[2] = nn.Linear(m.classifier[2].in_features, num_classes)
+    elif name == "custom_cnn":
+        m = CustomChestXrayCNN(num_classes=num_classes)
     else:
         raise ValueError(f"Unknown model: {name}")
     return m
@@ -1043,12 +1064,14 @@ def _plot_roc(all_labels, all_probs, class_names, num_classes, output_dir):
         print(f"ROC curve failed: {e}")
 
 
-def _generate_gradcam(model, dataloader, device, output_dir, class_names, num_images=4):
+def _generate_gradcam(model, dataloader, device, output_dir, class_names, num_correct=5, num_incorrect=5, seed=42):
     from pytorch_grad_cam import GradCAM
     from pytorch_grad_cam.utils.image import show_cam_on_image
     from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
-    if hasattr(model, "layer4"):
+    if isinstance(model, CustomChestXrayCNN):
+        target_layer = [model.features[-1][0]]
+    elif hasattr(model, "layer4"):
         target_layer = [model.layer4[-1]]
     elif hasattr(model, "features"):
         target_layer = [model.features[-1]]
@@ -1059,38 +1082,71 @@ def _generate_gradcam(model, dataloader, device, output_dir, class_names, num_im
     model.eval()
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
-    done = 0
-    per_class_limit = max(1, int(np.ceil(num_images / max(len(class_names), 1))))
-    class_counts = {index: 0 for index in range(len(class_names))}
-    for imgs, labels in dataloader:
-        imgs = imgs.to(device)
-        with torch.no_grad():
-            preds = model(imgs).argmax(1).cpu().tolist()
-        for i in range(imgs.size(0)):
-            if done >= num_images:
-                return
-            true_index = labels[i].item()
-            if class_counts.get(true_index, 0) >= per_class_limit:
-                continue
-            inp = imgs[i].unsqueeze(0)
-            pred_index = preds[i]
-            target = [ClassifierOutputTarget(pred_index)]
+
+    rng = random.Random(seed)
+    selected = {"correct": [], "incorrect": []}
+    seen = {"correct": 0, "incorrect": 0}
+    limits = {"correct": num_correct, "incorrect": num_incorrect}
+
+    with torch.no_grad():
+        for imgs, labels in dataloader:
+            imgs_device = imgs.to(device)
+            logits = model(imgs_device)
+            probs = torch.softmax(logits, dim=1)
+            confs, preds = probs.max(dim=1)
+            labels_cpu = labels.detach().cpu()
+            preds_cpu = preds.detach().cpu()
+            confs_cpu = confs.detach().cpu()
+            for index in range(imgs.size(0)):
+                label_index = int(labels_cpu[index].item())
+                pred_index = int(preds_cpu[index].item())
+                bucket = "correct" if pred_index == label_index else "incorrect"
+                if limits[bucket] <= 0:
+                    continue
+                seen[bucket] += 1
+                sample = {
+                    "image": imgs[index].detach().cpu(),
+                    "label": label_index,
+                    "pred": pred_index,
+                    "confidence": float(confs_cpu[index].item()),
+                }
+                if len(selected[bucket]) < limits[bucket]:
+                    selected[bucket].append(sample)
+                else:
+                    replace_index = rng.randrange(seen[bucket])
+                    if replace_index < limits[bucket]:
+                        selected[bucket][replace_index] = sample
+
+    def safe_name(value):
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+    for bucket in ("correct", "incorrect"):
+        if not selected[bucket]:
+            print(f"Grad-CAM: no {bucket} test predictions found.")
+            continue
+        for index, sample in enumerate(selected[bucket], start=1):
+            inp = sample["image"].unsqueeze(0).to(device)
+            target = [ClassifierOutputTarget(sample["pred"])]
             gc = cam(input_tensor=inp, targets=target)[0]
-            rgb = imgs[i].cpu().numpy().transpose(1, 2, 0)
+            rgb = sample["image"].numpy().transpose(1, 2, 0)
             rgb = np.clip(rgb * std + mean, 0, 1).astype(np.float32)
             overlay = show_cam_on_image(rgb, gc, use_rgb=True)
+            true_name = class_names[sample["label"]]
+            pred_name = class_names[sample["pred"]]
             fig, ax = plt.subplots(1, 1, figsize=(4, 4))
             ax.imshow(overlay)
-            ax.set_title(f"Grad-CAM — true {class_names[true_index]} / pred {class_names[pred_index]}")
+            ax.set_title(f"Grad-CAM - true {true_name} / pred {pred_name}")
             ax.axis("off")
-            plt.savefig(
-                os.path.join(output_dir, f"gradcam_{done}_true_{class_names[true_index]}_pred_{class_names[pred_index]}.png"),
-                dpi=100,
-                bbox_inches="tight",
+            filename = (
+                f"gradcam_{bucket}_{index:02d}_"
+                f"true_{safe_name(true_name)}_pred_{safe_name(pred_name)}.png"
             )
+            plt.savefig(os.path.join(output_dir, filename), dpi=100, bbox_inches="tight")
             plt.close()
-            class_counts[true_index] = class_counts.get(true_index, 0) + 1
-            done += 1
+            print(
+                f"Grad-CAM saved: {filename} "
+                f"(confidence={sample['confidence']:.3f})"
+            )
 
 
 # ── Excel export ─────────────────────────────────────────────────────

@@ -25,6 +25,7 @@ class ExperimentConfig:
     # Hyperparameters
     learning_rate: float = 0.001
     batch_size: int = 32
+    num_workers: int = 2
     epochs: int = 50
     optimizer: str = "adamw"
     train_split: float = 0.8
@@ -41,11 +42,6 @@ class ExperimentConfig:
     random_rotation: bool = False
     horizontal_flip: bool = False
     random_erasing: bool = False
-
-    # Image preprocessing (classification only)
-    resize_enabled: bool = True
-    resize_width: int = 224
-    resize_height: int = 224
 
     # Classification mode hint for GUI metric presets.
     three_class_classification: bool = False
@@ -81,6 +77,7 @@ class ExperimentConfig:
         "DenseNet-121": "densenet121",
         "EfficientNet-B0": "efficientnet_b0",
         "ConvNeXt": "convnext",
+        "Custom CNN": "custom_cnn",
     }
 
     OPTIMIZER_CHOICES = ["AdamW", "SGD"]
@@ -104,12 +101,30 @@ class ExperimentConfig:
 
     def build_train_command(self) -> str:
         """Build the CLI command to run train.py with configured args."""
+        if self.task_type == "classification" and self.model_name == "custom_cnn" and not self.use_builtin:
+            custom_parts = [
+                "cd /workspace && python custom_cnn_3class.py",
+                "--data_dir /workspace/data",
+                "--output_dir /workspace/output",
+                f"--lr {self.learning_rate}",
+                f"--batch_size {self.batch_size}",
+                f"--epochs {self.epochs}",
+                f"--patience {self.early_stopping_patience if self.early_stopping else self.epochs}",
+                f"--seed {self.seed}",
+                f"--random_erasing_p {0.15 if self.random_erasing else 0.0}",
+                f"--label_smoothing {0.05 if self.label_smoothing else 0.0}",
+            ]
+            if self.grad_cam:
+                custom_parts.append("--grad_cam")
+            return " ".join(custom_parts)
+
         parts = [
             "cd /workspace && python train.py",
             f"--task {self.task_type}",
             f"--model {self.model_name}",
             f"--lr {self.learning_rate}",
             f"--batch_size {self.batch_size}",
+            f"--num_workers {self.num_workers}",
             f"--epochs {self.epochs}",
             f"--optimizer {self.optimizer.lower()}",
             f"--data_dir /workspace/data",
@@ -120,7 +135,7 @@ class ExperimentConfig:
             f"--seed {self.seed}",
         ]
 
-        if not self.use_builtin and self.task_type == "classification":
+        if self.pre_split_data and not self.use_builtin:
             parts.append("--pre_split_data")
 
         # Built-in test dataset
@@ -128,7 +143,7 @@ class ExperimentConfig:
             parts.append("--use_builtin")
 
         # Test data
-        if self.test_data_path and not self.use_builtin and not self.pre_split_data and self.task_type == "regression":
+        if self.test_data_path and not self.use_builtin and not self.pre_split_data:
             parts.append("--test_dir /workspace/test_data")
 
         # Regression columns
@@ -140,10 +155,6 @@ class ExperimentConfig:
 
         # Augmentation (classification only)
         if self.task_type == "classification":
-            if self.resize_enabled:
-                parts.append(f"--resize_width {self.resize_width} --resize_height {self.resize_height}")
-            else:
-                parts.append("--no_resize")
             if self.random_rotation:
                 parts.append("--random_rotation")
             if self.horizontal_flip:

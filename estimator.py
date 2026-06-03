@@ -37,6 +37,11 @@ _BENCHMARKS = {
         "vram_per_k_images": 0.35,
         "ips": {"low": 90, "mid": 220, "high": 500},
     },
+    "custom_cnn": {
+        "vram_base_gb": 2.0,
+        "vram_per_k_images": 0.15,
+        "ips": {"low": 180, "mid": 420, "high": 900},
+    },
 }
 
 # GPU tier classification by VRAM
